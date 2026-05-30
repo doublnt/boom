@@ -1,0 +1,1673 @@
+#!/bin/bash
+
+set -eo pipefail
+
+BOOM_HOME="${BOOM_HOME:-${QQ_HOME:-$HOME/.boom}}"
+REAL_CLAUDE="${BOOM_REAL_CLAUDE:-${QQ_REAL_CLAUDE:-}}"
+REAL_CODEX="${BOOM_REAL_CODEX:-${QQ_REAL_CODEX:-/opt/homebrew/bin/codex}}"
+
+CLAUDE_HOME="$BOOM_HOME/claude"
+CLAUDE_PROFILES="$CLAUDE_HOME/profiles"
+CLAUDE_COMMON="$CLAUDE_HOME/common.json"
+CLAUDE_DEFAULT="$CLAUDE_HOME/default"
+
+CODEX_HOME_ROOT="$BOOM_HOME/codex"
+CODEX_PROFILES="$CODEX_HOME_ROOT/profiles"
+CODEX_DEFAULT="$CODEX_HOME_ROOT/default"
+CODEX_SHARED="$CODEX_HOME_ROOT/shared"
+
+die() {
+  printf 'boom: %s\n' "$*" >&2
+  exit 1
+}
+
+find_real_claude() {
+  local candidate
+  if [ -n "${REAL_CLAUDE:-}" ]; then
+    printf '%s\n' "$REAL_CLAUDE"
+    return 0
+  fi
+  for candidate in "$HOME/.local/bin/claude" "/opt/homebrew/bin/claude" "/usr/local/bin/claude"; do
+    if [ -x "$candidate" ] && [ "$candidate" != "$0" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  while IFS= read -r candidate; do
+    if [ -x "$candidate" ] && [ "$candidate" != "$0" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done < <(command -v -a claude 2>/dev/null || which -a claude 2>/dev/null || true)
+  return 1
+}
+
+REAL_CLAUDE="$(find_real_claude || true)"
+
+usage() {
+  cat <<'EOF'
+boom - unified Claude/Codex launcher
+
+Usage:
+  boom
+  boom -h | --help | help
+  boom status
+  boom usage
+
+  boom claude [name] [--safe] [--no-profile] [-- <claude args...>]
+  boom codex  [name] [--safe] [--no-profile] [-- <codex args...>]
+
+Short aliases:
+  boom c [name] [...]
+  boom x [name] [...]
+
+Claude commands:
+  boom claude list
+  boom claude add <name>
+  boom claude edit [name]
+  boom claude show [name]
+  boom claude default <name>
+  boom claude remove <name>
+  boom claude doctor
+
+Codex commands:
+  boom codex add <name>
+  boom codex edit [name]
+  boom codex list
+  boom codex list
+  boom codex default <name>
+  boom codex remove <name>
+  boom codex doctor
+
+Examples:
+  boom claude
+  boom claude minimax
+  boom claude list
+  boom status
+  boom usage
+  boom codex
+  boom codex add my-plus
+  boom codex yinxi-plus
+  boom codex list
+  boom claude minimax -- -p "reply OK"
+  boom codex yinxi-plus -- exec "reply OK"
+
+By default boom adds the existing fast-path permissions:
+  Claude: --dangerously-skip-permissions
+  Codex:  --dangerously-bypass-approvals-and-sandbox
+
+Use --safe to skip those flags.
+EOF
+}
+
+ensure_dir() {
+  mkdir -p "$1"
+  chmod 700 "$1" 2>/dev/null || true
+}
+
+ensure_layout() {
+  ensure_dir "$BOOM_HOME"
+  ensure_dir "$CLAUDE_HOME"
+  ensure_dir "$CLAUDE_PROFILES"
+  ensure_dir "$CODEX_HOME_ROOT"
+  ensure_dir "$CODEX_PROFILES"
+}
+
+validate_name() {
+  local name="$1"
+  [ -n "$name" ] || die "name cannot be empty"
+  case "$name" in
+    *[!A-Za-z0-9._-]*)
+      die "name can only contain letters, numbers, dot, underscore, and dash"
+      ;;
+  esac
+}
+
+normalize_name() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g'
+}
+
+get_default() {
+  local file="$1"
+  if [ -f "$file" ]; then
+    head -n 1 "$file" | tr -d '[:space:]'
+  fi
+}
+
+set_default_file() {
+  local file="$1"
+  local name="$2"
+  umask 077
+  printf '%s\n' "$name" > "$file"
+  chmod 600 "$file"
+}
+
+profile_name_from_json_path() {
+  local file="$1"
+  local base="${file##*/}"
+  printf '%s\n' "${base%.json}"
+}
+
+resolve_claude_profile() {
+  local requested="$1"
+  local requested_norm
+  local file
+  local base
+  local match=""
+
+  validate_name "$requested"
+  requested_norm="$(normalize_name "$requested")"
+
+  if [ -f "$CLAUDE_PROFILES/$requested.json" ]; then
+    printf '%s\n' "$CLAUDE_PROFILES/$requested.json"
+    return 0
+  fi
+
+  for file in "$CLAUDE_PROFILES"/*.json; do
+    [ -e "$file" ] || continue
+    base="$(profile_name_from_json_path "$file")"
+    if [ "$(normalize_name "$base")" = "$requested_norm" ]; then
+      [ -z "$match" ] || die "multiple Claude configs match '$requested'; use the exact name"
+      match="$file"
+    fi
+  done
+
+  [ -n "$match" ] || return 1
+  printf '%s\n' "$match"
+}
+
+resolve_codex_profile() {
+  local requested="$1"
+  local requested_norm
+  local dir
+  local base
+  local match=""
+
+  validate_name "$requested"
+  requested_norm="$(normalize_name "$requested")"
+
+  if [ -d "$CODEX_PROFILES/$requested" ]; then
+    printf '%s\n' "$CODEX_PROFILES/$requested"
+    return 0
+  fi
+
+  for dir in "$CODEX_PROFILES"/*; do
+    [ -d "$dir" ] || continue
+    base="${dir##*/}"
+    if [ "$(normalize_name "$base")" = "$requested_norm" ]; then
+      [ -z "$match" ] || die "multiple Codex configs match '$requested'; use the exact name"
+      match="$dir"
+    fi
+  done
+
+  [ -n "$match" ] || return 1
+  printf '%s\n' "$match"
+}
+
+list_claude_names() {
+  local file
+  for file in "$CLAUDE_PROFILES"/*.json; do
+    [ -e "$file" ] || continue
+    profile_name_from_json_path "$file"
+  done | sort
+}
+
+list_codex_names() {
+  local dir
+  for dir in "$CODEX_PROFILES"/*; do
+    [ -d "$dir" ] || continue
+    printf '%s\n' "${dir##*/}"
+  done | sort
+}
+
+print_missing_profiles() {
+  local kind="$1"
+  if [ "$kind" = "claude" ]; then
+    list_claude_names | sed 's/^/  /' >&2
+  else
+    list_codex_names | sed 's/^/  /' >&2
+  fi
+}
+
+merged_claude_settings() {
+  local profile_path="$1"
+  local tmp_path
+
+  tmp_path="$(mktemp "${TMPDIR:-/tmp}/boom-claude-settings.XXXXXX")"
+  chmod 600 "$tmp_path"
+
+  node - "$CLAUDE_COMMON" "$profile_path" "$tmp_path" <<'NODE'
+const fs = require("fs");
+const [commonPath, profilePath, outputPath] = process.argv.slice(2);
+
+function readJson(file) {
+  if (!fs.existsSync(file)) return {};
+  return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+function isObj(value) {
+  return value && typeof value === "object" && !Array.isArray(value);
+}
+function merge(base, override) {
+  const result = { ...base };
+  for (const [key, value] of Object.entries(override)) {
+    result[key] = isObj(result[key]) && isObj(value) ? merge(result[key], value) : value;
+  }
+  return result;
+}
+
+const common = readJson(commonPath);
+const profile = readJson(profilePath);
+const merged = merge(common, profile);
+const env = profile.env && typeof profile.env === "object" && !Array.isArray(profile.env)
+  ? profile.env
+  : {};
+
+if (!("model" in profile) && !env.ANTHROPIC_MODEL && !env.ANTHROPIC_BASE_URL && !env.ANTHROPIC_AUTH_TOKEN) {
+  delete merged.model;
+}
+
+fs.writeFileSync(outputPath, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
+NODE
+
+  printf '%s\n' "$tmp_path"
+}
+
+is_official_claude_profile() {
+  local profile_path="$1"
+  node - "$profile_path" <<'NODE'
+const fs = require("fs");
+const profile = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const env = profile.env && typeof profile.env === "object" && !Array.isArray(profile.env)
+  ? profile.env
+  : {};
+const hasThirdPartyConfig = Boolean(
+  env.ANTHROPIC_BASE_URL ||
+  env.ANTHROPIC_API_KEY ||
+  env.ANTHROPIC_AUTH_TOKEN ||
+  env.ANTHROPIC_MODEL ||
+  env.ANTHROPIC_REASONING_MODEL ||
+  env.ANTHROPIC_DEFAULT_HAIKU_MODEL ||
+  env.ANTHROPIC_DEFAULT_OPUS_MODEL ||
+  env.ANTHROPIC_DEFAULT_SONNET_MODEL ||
+  env.ANTHROPIC_SMALL_FAST_MODEL ||
+  profile.apiBaseUrl ||
+  profile.primaryModel ||
+  profile.smallFastModel ||
+  profile.model
+);
+process.exit(hasThirdPartyConfig ? 1 : 0);
+NODE
+}
+
+clear_claude_provider_env() {
+  unset ANTHROPIC_BASE_URL
+  unset ANTHROPIC_AUTH_TOKEN
+  unset ANTHROPIC_API_KEY
+  unset ANTHROPIC_MODEL
+  unset ANTHROPIC_REASONING_MODEL
+  unset ANTHROPIC_DEFAULT_HAIKU_MODEL
+  unset ANTHROPIC_DEFAULT_OPUS_MODEL
+  unset ANTHROPIC_DEFAULT_SONNET_MODEL
+  unset ANTHROPIC_SMALL_FAST_MODEL
+  unset CLAUDE_CODE_SUBAGENT_MODEL
+  unset CLAUDE_CODE_EFFORT_LEVEL
+  unset CLAUDE_CODE_USE_BEDROCK
+  unset CLAUDE_CODE_USE_VERTEX
+}
+
+run_claude_with_settings() {
+  local profile_path="$1"
+  shift
+  local settings_path
+  local status
+
+  settings_path="$(merged_claude_settings "$profile_path")"
+  clear_claude_provider_env
+  "$REAL_CLAUDE" --settings "$settings_path" "$@"
+  status=$?
+  rm -f "$settings_path"
+  exit "$status"
+}
+
+run_claude_with_user_settings_swap() {
+  local profile_path="$1"
+  shift
+  local settings_file="$HOME/.claude/settings.json"
+  local backup_file
+  local effective_settings
+  local merged_settings
+  local status
+
+  mkdir -p "$HOME/.claude"
+  backup_file="$(mktemp "${TMPDIR:-/tmp}/boom-claude-user-settings.XXXXXX")"
+  effective_settings="$(mktemp "${TMPDIR:-/tmp}/boom-claude-official-settings.XXXXXX")"
+  if [ -f "$settings_file" ]; then
+    cp "$settings_file" "$backup_file"
+  else
+    : > "$backup_file"
+  fi
+
+  restore_settings() {
+    if [ -s "$backup_file" ]; then
+      cp "$backup_file" "$settings_file"
+      chmod 600 "$settings_file" 2>/dev/null || true
+    else
+      rm -f "$settings_file"
+    fi
+    rm -f "$backup_file" "$effective_settings" "${merged_settings:-}"
+  }
+
+  trap restore_settings EXIT INT TERM
+
+  merged_settings="$(merged_claude_settings "$profile_path")"
+  node - "$merged_settings" "$effective_settings" <<'NODE'
+const fs = require("fs");
+const [settingsPath, outputPath] = process.argv.slice(2);
+const profile = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+for (const key of ["api_format", "apiFormat", "openrouter_compat_mode", "openrouterCompatMode"]) {
+  delete profile[key];
+}
+fs.writeFileSync(outputPath, `${JSON.stringify(profile, null, 2)}\n`, { mode: 0o600 });
+NODE
+
+  cp "$effective_settings" "$settings_file"
+  chmod 600 "$settings_file" 2>/dev/null || true
+  clear_claude_provider_env
+  "$REAL_CLAUDE" "$@"
+  status=$?
+  restore_settings
+  trap - EXIT INT TERM
+  exit "$status"
+}
+
+claude_add() {
+  local name="${1:-}"
+  local path
+  local base_url
+  local api_key
+  local model
+
+  validate_name "$name"
+  path="$CLAUDE_PROFILES/$name.json"
+  [ ! -e "$path" ] || die "Claude config '$name' already exists"
+
+  printf 'Base URL: '
+  IFS= read -r base_url
+  printf 'API Key: '
+  if [ -t 0 ]; then
+    stty -echo
+    IFS= read -r api_key
+    stty echo
+    printf '\n'
+  else
+    IFS= read -r api_key
+  fi
+  printf 'Model: '
+  IFS= read -r model
+
+  [ -n "$base_url" ] || die "base URL is required"
+  [ -n "$api_key" ] || die "API key is required"
+  [ -n "$model" ] || die "model is required"
+
+  umask 077
+  cat > "$path" <<EOF
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "$(json_escape "$base_url")",
+    "ANTHROPIC_AUTH_TOKEN": "$(json_escape "$api_key")",
+    "ANTHROPIC_MODEL": "$(json_escape "$model")",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "$(json_escape "$model")",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "$(json_escape "$model")",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$(json_escape "$model")",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "$(json_escape "$model")",
+    "API_TIMEOUT_MS": "600000",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  }
+}
+EOF
+  chmod 600 "$path"
+  printf "Added Claude config '%s'.\n" "$name"
+}
+
+claude_edit() {
+  local requested="${1:-}"
+  local path
+  local current_name
+  local current_base_url
+  local current_model
+  local is_official=0
+  local new_name
+  local new_base_url
+  local new_api_key
+  local new_model
+  local new_path
+  local tmp_path
+  local default_profile
+
+  if [ -z "$requested" ]; then
+    requested="$(get_default "$CLAUDE_DEFAULT")"
+    [ -n "$requested" ] || die "usage: boom claude edit <name>"
+  fi
+
+  if ! path="$(resolve_claude_profile "$requested")"; then
+    printf "Claude config '%s' does not exist.\n" "$requested" >&2
+    print_missing_profiles claude
+    exit 1
+  fi
+
+  current_name="$(profile_name_from_json_path "$path")"
+  current_base_url="$(node -e 'const fs=require("fs"); const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.stdout.write((j.env&&j.env.ANTHROPIC_BASE_URL)||"");' "$path")"
+  current_model="$(node -e 'const fs=require("fs"); const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const e=j.env||{}; process.stdout.write(e.ANTHROPIC_MODEL||e.ANTHROPIC_DEFAULT_SONNET_MODEL||"");' "$path")"
+  if is_official_claude_profile "$path"; then
+    is_official=1
+  fi
+
+  printf 'Profile name [%s]: ' "$current_name"
+  IFS= read -r new_name
+  [ -n "$new_name" ] || new_name="$current_name"
+  validate_name "$new_name"
+
+  new_path="$CLAUDE_PROFILES/$new_name.json"
+  [ "$new_path" = "$path" ] || [ ! -e "$new_path" ] || die "Claude config '$new_name' already exists"
+
+  if [ "$is_official" -eq 1 ]; then
+    if [ "$new_path" != "$path" ]; then
+      mv "$path" "$new_path"
+      chmod 600 "$new_path"
+    fi
+  else
+    printf 'Base URL [%s]: ' "$current_base_url"
+    IFS= read -r new_base_url
+    [ -n "$new_base_url" ] || new_base_url="$current_base_url"
+
+    printf 'API Key [leave blank to keep current]: '
+    if [ -t 0 ]; then
+      stty -echo
+      IFS= read -r new_api_key
+      stty echo
+      printf '\n'
+    else
+      IFS= read -r new_api_key
+    fi
+
+    printf 'Model [%s]: ' "$current_model"
+    IFS= read -r new_model
+    [ -n "$new_model" ] || new_model="$current_model"
+    [ -n "$new_base_url" ] || die "base URL is required"
+    [ -n "$new_model" ] || die "model is required"
+
+    tmp_path="$(mktemp "$CLAUDE_PROFILES/.${new_name}.tmp.XXXXXX")"
+    chmod 600 "$tmp_path"
+    node - "$path" "$tmp_path" "$new_base_url" "$new_api_key" "$new_model" <<'NODE'
+const fs = require("fs");
+const [inputPath, outputPath, baseUrl, apiKey, model] = process.argv.slice(2);
+const config = JSON.parse(fs.readFileSync(inputPath, "utf8"));
+config.env = config.env && typeof config.env === "object" && !Array.isArray(config.env) ? config.env : {};
+config.env.ANTHROPIC_BASE_URL = baseUrl;
+if (apiKey) config.env.ANTHROPIC_AUTH_TOKEN = apiKey;
+config.env.ANTHROPIC_MODEL = model;
+config.env.ANTHROPIC_DEFAULT_SONNET_MODEL = model;
+config.env.ANTHROPIC_DEFAULT_OPUS_MODEL = model;
+config.env.ANTHROPIC_DEFAULT_HAIKU_MODEL = model;
+config.env.CLAUDE_CODE_SUBAGENT_MODEL = model;
+fs.writeFileSync(outputPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+NODE
+    mv "$tmp_path" "$new_path"
+    chmod 600 "$new_path"
+  fi
+
+  if [ "$new_path" != "$path" ]; then
+    default_profile="$(get_default "$CLAUDE_DEFAULT")"
+    if [ "$default_profile" = "$current_name" ]; then
+      set_default_file "$CLAUDE_DEFAULT" "$new_name"
+    fi
+    printf "Updated Claude config '%s' and renamed it to '%s'.\n" "$current_name" "$new_name"
+  else
+    printf "Updated Claude config '%s'.\n" "$current_name"
+  fi
+}
+
+claude_show() {
+  local requested=""
+  local path
+  local settings_path
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --help|-h)
+        printf 'Usage: boom claude show [name]\n'
+        return 0
+        ;;
+      *)
+        [ -z "$requested" ] || die "usage: boom claude show [name]"
+        requested="$1"
+        ;;
+    esac
+    shift || true
+  done
+
+  if [ -z "$requested" ]; then
+    requested="$(get_default "$CLAUDE_DEFAULT")"
+    [ -n "$requested" ] || die "usage: boom claude show <name> (or set a default Claude config first)"
+  fi
+
+  if ! path="$(resolve_claude_profile "$requested")"; then
+    printf "Claude config '%s' does not exist.\n" "$requested" >&2
+    print_missing_profiles claude
+    exit 1
+  fi
+
+  settings_path="$(merged_claude_settings "$path")"
+  jq . "$settings_path"
+  rm -f "$settings_path"
+}
+
+profile_list() {
+  local kind="$1"
+  local default_file="$2"
+  local name
+  local default_profile
+  local count=0
+
+  default_profile="$(get_default "$default_file")"
+  if [ "$kind" = "claude" ]; then
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      count=$((count + 1))
+      [ "$name" = "$default_profile" ] && printf '* %s (default)\n' "$name" || printf '  %s\n' "$name"
+    done < <(list_claude_names)
+  else
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      count=$((count + 1))
+      [ "$name" = "$default_profile" ] && printf '* %s (default)\n' "$name" || printf '  %s\n' "$name"
+    done < <(list_codex_names)
+  fi
+  [ "$count" -gt 0 ] || printf 'No %s configs found.\n' "$kind"
+}
+
+claude_default() {
+  local requested="${1:-}"
+  local path
+  [ -n "$requested" ] || die "usage: boom claude default <name>"
+  path="$(resolve_claude_profile "$requested")" || die "Claude config '$requested' does not exist"
+  set_default_file "$CLAUDE_DEFAULT" "$(profile_name_from_json_path "$path")"
+  printf "Default Claude config set to '%s'.\n" "$(profile_name_from_json_path "$path")"
+}
+
+codex_default() {
+  local requested="${1:-}"
+  local dir
+  [ -n "$requested" ] || die "usage: boom codex default <name>"
+  dir="$(resolve_codex_profile "$requested")" || die "Codex config '$requested' does not exist"
+  set_default_file "$CODEX_DEFAULT" "${dir##*/}"
+  printf "Default Codex config set to '%s'.\n" "${dir##*/}"
+}
+
+claude_remove() {
+  local requested="${1:-}"
+  local path
+  local name
+  local default_profile
+  [ -n "$requested" ] || die "usage: boom claude remove <name>"
+  path="$(resolve_claude_profile "$requested")" || die "Claude config '$requested' does not exist"
+  name="$(profile_name_from_json_path "$path")"
+  rm -f "$path"
+  default_profile="$(get_default "$CLAUDE_DEFAULT")"
+  if [ "$default_profile" = "$name" ]; then
+    rm -f "$CLAUDE_DEFAULT"
+    printf "Removed Claude config '%s' and cleared the default.\n" "$name"
+  else
+    printf "Removed Claude config '%s'.\n" "$name"
+  fi
+}
+
+codex_remove() {
+  local requested="${1:-}"
+  local dir
+  local name
+  local default_profile
+  [ -n "$requested" ] || die "usage: boom codex remove <name>"
+  dir="$(resolve_codex_profile "$requested")" || die "Codex config '$requested' does not exist"
+  name="${dir##*/}"
+  rm -rf "$dir"
+  default_profile="$(get_default "$CODEX_DEFAULT")"
+  if [ "$default_profile" = "$name" ]; then
+    rm -f "$CODEX_DEFAULT"
+    printf "Removed Codex config '%s' and cleared the default.\n" "$name"
+  else
+    printf "Removed Codex config '%s'.\n" "$name"
+  fi
+}
+
+codex_edit() {
+  local requested="${1:-}"
+  local dir
+  local current_name
+  local new_name
+  local new_dir
+  local default_profile
+  local do_login=0
+  local status
+
+  if [ -z "$requested" ]; then
+    requested="$(get_default "$CODEX_DEFAULT")"
+    [ -n "$requested" ] || die "usage: boom codex edit <name>"
+  fi
+
+  if ! dir="$(resolve_codex_profile "$requested")"; then
+    printf "Codex config '%s' does not exist.\n" "$requested" >&2
+    print_missing_profiles codex
+    exit 1
+  fi
+
+  current_name="${dir##*/}"
+
+  printf 'Profile name [%s]: ' "$current_name"
+  IFS= read -r new_name
+  [ -n "$new_name" ] || new_name="$current_name"
+  validate_name "$new_name"
+
+  new_dir="$CODEX_PROFILES/$new_name"
+  [ "$new_dir" = "$dir" ] || [ ! -e "$new_dir" ] || die "Codex config '$new_name' already exists"
+
+  printf 'Re-login? [y/N]: '
+  IFS= read -r do_login_answer
+  case "$do_login_answer" in
+    [Yy]*) do_login=1 ;;
+  esac
+
+  if [ "$new_dir" != "$dir" ]; then
+    mv "$dir" "$new_dir"
+    default_profile="$(get_default "$CODEX_DEFAULT")"
+    if [ "$default_profile" = "$current_name" ]; then
+      set_default_file "$CODEX_DEFAULT" "$new_name"
+    fi
+    printf "Renamed Codex config '%s' to '%s'.\n" "$current_name" "$new_name"
+    dir="$new_dir"
+  else
+    printf "Codex config '%s' unchanged.\n" "$current_name"
+  fi
+
+  if [ "$do_login" -eq 1 ]; then
+    printf "Starting Codex login for '%s'. Finish the browser/device login flow when prompted.\n" "$new_name"
+    set +e
+    CODEX_HOME="$dir" "$REAL_CODEX" login
+    status=$?
+    set -e
+    if [ "$status" -ne 0 ]; then
+      printf "Codex login exited with status %s.\n" "$status" >&2
+      printf "Retry later with: boom codex %s -- login\n" "$new_name" >&2
+      return "$status"
+    fi
+    if [ -f "$dir/auth.json" ]; then
+      chmod 600 "$dir/auth.json" 2>/dev/null || true
+      printf "Codex config '%s' is logged in.\n" "$new_name"
+    fi
+  fi
+}
+
+codex_add() {
+  local requested="${1:-}"
+  local dir
+  local default_profile
+  local default_dir=""
+  local no_login=0
+  local make_default=0
+  local status
+
+  [ -n "$requested" ] || die "usage: boom codex add <name> [--default] [--no-login]"
+  validate_name "$requested"
+  shift || true
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --default)
+        make_default=1
+        ;;
+      --no-login)
+        no_login=1
+        ;;
+      --help|-h)
+        printf 'Usage: boom codex add <name> [--default] [--no-login]\n'
+        return 0
+        ;;
+      *)
+        die "unknown option for boom codex add: $1"
+        ;;
+    esac
+    shift || true
+  done
+
+  dir="$CODEX_PROFILES/$requested"
+  [ ! -e "$dir" ] || die "Codex config '$requested' already exists"
+  [ -x "$REAL_CODEX" ] || die "real Codex not found: $REAL_CODEX"
+
+  mkdir -p "$dir"
+  chmod 700 "$dir" 2>/dev/null || true
+
+  # 共享 sessions / history / state_5.sqlite，保证 /resume 跨配置可用
+  ensure_dir "$CODEX_SHARED/sessions"
+  ensure_dir "$CODEX_SHARED/archived_sessions"
+  for item in sessions archived_sessions history.jsonl state_5.sqlite; do
+    [ -e "$dir/$item" ] || ln -s "$CODEX_SHARED/$item" "$dir/$item"
+  done
+
+  default_profile="$(get_default "$CODEX_DEFAULT")"
+  if [ -n "$default_profile" ]; then
+    default_dir="$(resolve_codex_profile "$default_profile" 2>/dev/null || true)"
+  fi
+
+  if [ -n "$default_dir" ] && [ -f "$default_dir/config.toml" ]; then
+    cp "$default_dir/config.toml" "$dir/config.toml"
+  elif [ -f "$HOME/.codex/config.toml" ]; then
+    cp "$HOME/.codex/config.toml" "$dir/config.toml"
+  else
+    : > "$dir/config.toml"
+  fi
+  chmod 600 "$dir/config.toml" 2>/dev/null || true
+
+  if [ "$make_default" -eq 1 ] || [ -z "$(get_default "$CODEX_DEFAULT")" ]; then
+    set_default_file "$CODEX_DEFAULT" "$requested"
+  fi
+
+  printf "Created Codex config '%s': %s\n" "$requested" "$dir"
+  if [ "$no_login" -eq 1 ]; then
+    printf "Login skipped. Run: boom codex %s -- login\n" "$requested"
+    return 0
+  fi
+
+  printf "Starting Codex login for '%s'. Finish the browser/device login flow when prompted.\n" "$requested"
+  set +e
+  CODEX_HOME="$dir" "$REAL_CODEX" login
+  status=$?
+  set -e
+
+  if [ "$status" -ne 0 ]; then
+    printf "Codex login exited with status %s. The config directory was kept.\n" "$status" >&2
+    printf "Retry later with: boom codex %s -- login\n" "$requested" >&2
+    return "$status"
+  fi
+
+  if [ -f "$dir/auth.json" ]; then
+    chmod 600 "$dir/auth.json" 2>/dev/null || true
+    printf "Codex config '%s' is logged in.\n" "$requested"
+  else
+    printf "Codex login finished, but auth.json was not found. Check with: boom codex %s -- login status\n" "$requested" >&2
+  fi
+}
+
+claude_doctor() {
+  local default_profile
+  local default_path
+  local status=0
+  printf 'boom Claude Doctor\n\n'
+  printf 'Real Claude:\n  %s\n' "$REAL_CLAUDE"
+  if [ -x "$REAL_CLAUDE" ]; then
+    "$REAL_CLAUDE" --version 2>/dev/null | sed 's/^/  version: /' || true
+  else
+    printf '  ERROR: not found or not executable.\n'
+    status=1
+  fi
+  printf '\nConfig:\n  %s\n' "$CLAUDE_HOME"
+  [ -f "$CLAUDE_COMMON" ] && printf '  common: OK\n' || printf '  common: none\n'
+  default_profile="$(get_default "$CLAUDE_DEFAULT")"
+  if [ -n "$default_profile" ]; then
+    if default_path="$(resolve_claude_profile "$default_profile" 2>/dev/null)"; then
+      printf '  default: %s (%s)\n' "$default_profile" "$default_path"
+    else
+      printf '  ERROR: default config %s is missing\n' "$default_profile"
+      status=1
+    fi
+  else
+    printf '  default: none\n'
+  fi
+  printf '\nConfigs:\n'
+  list_claude_names | sed 's/^/  /'
+  return "$status"
+}
+
+codex_doctor() {
+  local default_profile
+  local default_dir
+  local status=0
+  printf 'boom Codex Doctor\n\n'
+  printf 'Real Codex:\n  %s\n' "$REAL_CODEX"
+  if [ -x "$REAL_CODEX" ]; then
+    "$REAL_CODEX" --version 2>/dev/null | sed 's/^/  version: /' || true
+  else
+    printf '  ERROR: not found or not executable.\n'
+    status=1
+  fi
+  printf '\nConfig:\n  %s\n' "$CODEX_HOME_ROOT"
+  default_profile="$(get_default "$CODEX_DEFAULT")"
+  if [ -n "$default_profile" ]; then
+    if default_dir="$(resolve_codex_profile "$default_profile" 2>/dev/null)"; then
+      printf '  default: %s (%s)\n' "$default_profile" "$default_dir"
+      [ -f "$default_dir/config.toml" ] || { printf '  ERROR: default config.toml missing\n'; status=1; }
+      [ -f "$default_dir/auth.json" ] || { printf '  ERROR: default auth.json missing\n'; status=1; }
+    else
+      printf '  ERROR: default config %s is missing\n' "$default_profile"
+      status=1
+    fi
+  else
+    printf '  default: none\n'
+  fi
+  printf '\nConfigs:\n'
+  list_codex_names | sed 's/^/  /'
+  return "$status"
+}
+
+qq_status() {
+  ensure_layout
+  node - "$CLAUDE_DEFAULT" "$CLAUDE_PROFILES" "$CODEX_DEFAULT" "$CODEX_PROFILES" <<'NODE'
+const fs = require("fs");
+const { execFileSync } = require("child_process");
+const [claudeDefaultPath, claudeProfilesDir, codexDefaultPath, codexProfilesDir] = process.argv.slice(2);
+const colorEnabled = Boolean(process.env.BOOM_FORCE_COLOR || process.env.CLICOLOR_FORCE) || (!process.env.NO_COLOR && process.stdout.isTTY);
+const C = colorEnabled ? {
+  reset: "\x1b[0m",
+  bold: "\x1b[1m",
+  dim: "\x1b[2m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  red: "\x1b[31m",
+  cyan: "\x1b[36m",
+  magenta: "\x1b[35m",
+} : {};
+function paint(value, color) {
+  return colorEnabled ? `${C[color]}${value}${C.reset}` : String(value);
+}
+function statusColor(status) {
+  if (status === "ok") return "green";
+  if (status === "high") return "yellow";
+  if (status === "limited") return "red";
+  return "dim";
+}
+function usageColor(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "dim";
+  if (value >= 95) return "red";
+  if (value >= 80) return "yellow";
+  return "green";
+}
+
+function readText(file) {
+  try { return fs.readFileSync(file, "utf8").trim(); } catch { return ""; }
+}
+function readJson(file) {
+  return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+function pct(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "unknown";
+  return `${Math.round(value)}%`;
+}
+function localTime(value) {
+  if (value === null || value === undefined || value === "") return "unknown";
+  let date;
+  if (typeof value === "number") date = new Date(value < 1e12 ? value * 1000 : value);
+  else date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+function line(label, used, reset) {
+  console.log(`  ${paint(label, "cyan")}: ${paint(pct(used), usageColor(used))} used, reset ${paint(localTime(reset), "dim")}`);
+}
+function section(title) {
+  console.log(paint(title, "bold"));
+}
+function fail(msg) {
+  console.log(`  ${paint(msg, "red")}`);
+}
+function claudeTokenFromKeychain() {
+  try {
+    const raw = execFileSync("security", ["find-generic-password", "-s", "Claude Code-credentials", "-w"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const json = JSON.parse(raw);
+    return (json.claudeAiOauth || json["claude.ai_oauth"] || {}).accessToken || "";
+  } catch {
+    return "";
+  }
+}
+function claudeTokenFromFile() {
+  try {
+    const json = readJson(`${process.env.HOME}/.claude/.credentials.json`);
+    return (json.claudeAiOauth || json["claude.ai_oauth"] || {}).accessToken || "";
+  } catch {
+    return "";
+  }
+}
+function statusForUtilization(values) {
+  const max = values.filter((v) => typeof v === "number").reduce((a, b) => Math.max(a, b), -1);
+  if (max < 0) return "unknown";
+  if (max >= 95) return "limited";
+  if (max >= 80) return "high";
+  return "ok";
+}
+async function fetchJson(url, options) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    const text = await res.text();
+    let body = null;
+    try { body = text ? JSON.parse(text) : null; } catch {}
+    return { ok: res.ok, status: res.status, body, text };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function showClaudeOfficial() {
+  section("Claude Official");
+  const token = claudeTokenFromKeychain() || claudeTokenFromFile();
+  if (!token) {
+    fail("not logged in or credential not found");
+    return;
+  }
+  try {
+    const res = await fetchJson("https://api.anthropic.com/api/oauth/usage", {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "anthropic-beta": "oauth-2025-04-20",
+        Accept: "application/json",
+      },
+    });
+    if (!res.ok || !res.body) {
+      fail(`query failed: HTTP ${res.status}`);
+      return;
+    }
+    const body = res.body;
+    const values = [];
+    if (body.five_hour) {
+      values.push(body.five_hour.utilization);
+      line("5h", body.five_hour.utilization, body.five_hour.resets_at);
+    }
+    for (const key of ["seven_day", "seven_day_opus", "seven_day_sonnet"]) {
+      const item = body[key];
+      if (item && typeof item.utilization === "number") {
+        values.push(item.utilization);
+        line(key.replace("seven_day", "7d").replace(/_/g, " "), item.utilization, item.resets_at);
+      }
+    }
+    if (!values.length) fail("no quota windows returned");
+    const extra = body.extra_usage;
+    if (extra && extra.is_enabled) {
+      const limit = extra.monthly_limit ?? "unknown";
+      const used = extra.used_credits ?? "unknown";
+      console.log(`  extra: ${used}/${limit} ${extra.currency || ""}`.trimEnd());
+    }
+    const status = statusForUtilization(values);
+    console.log(`  status: ${paint(status, statusColor(status))}`);
+  } catch (e) {
+    fail(`query failed: ${e.message}`);
+  }
+}
+
+function listClaudeProfileNames() {
+  try {
+    return fs.readdirSync(claudeProfilesDir)
+      .filter((name) => name.endsWith(".json"))
+      .map((name) => name.slice(0, -5))
+      .sort((a, b) => a.localeCompare(b));
+  } catch {
+    return [];
+  }
+}
+function listCodexProfileNames() {
+  try {
+    return fs.readdirSync(codexProfilesDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort((a, b) => a.localeCompare(b));
+  } catch {
+    return [];
+  }
+}
+
+async function showClaudeCodingPlanProfile(name) {
+  const file = `${claudeProfilesDir}/${name}.json`;
+  if (!fs.existsSync(file)) return false;
+  let profile;
+  try { profile = readJson(file); } catch { return false; }
+  const env = profile.env || {};
+  const base = env.ANTHROPIC_BASE_URL || "";
+  const token = env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY || "";
+  if (!base || !token) return false;
+  if (!/api\.minimax(i)?\.(com|io)/i.test(base)) return false;
+
+  const defaultName = readText(claudeDefaultPath);
+  section(`Claude MiniMax (${name}${name === defaultName ? ", default" : ""})`);
+  try {
+    const host = base.includes("api.minimax.io") ? "api.minimax.io" : "api.minimaxi.com";
+    const res = await fetchJson(`https://${host}/v1/api/openplatform/coding_plan/remains`, {
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    });
+    if (!res.ok || !res.body) {
+      fail(`query failed: HTTP ${res.status}`);
+      return true;
+    }
+    const first = (res.body.model_remains || [])[0];
+    if (!first) {
+      fail("no coding plan data returned");
+      return true;
+    }
+    const fiveTotal = Number(first.current_interval_total_count || 0);
+    const fiveRemaining = Number(first.current_interval_usage_count || 0);
+    const weekTotal = Number(first.current_weekly_total_count || 0);
+    const weekRemaining = Number(first.current_weekly_usage_count || 0);
+    const values = [];
+    if (fiveTotal > 0) {
+      const used = ((fiveTotal - fiveRemaining) / fiveTotal) * 100;
+      values.push(used);
+      line("5h", used, first.end_time);
+    }
+    if (weekTotal > 0) {
+      const used = ((weekTotal - weekRemaining) / weekTotal) * 100;
+      values.push(used);
+      line("weekly", used, first.weekly_end_time);
+    }
+    const status = statusForUtilization(values);
+    console.log(`  status: ${paint(status, statusColor(status))}`);
+  } catch (e) {
+    fail(`query failed: ${e.message}`);
+  }
+  return true;
+}
+
+async function showAllClaudeCodingPlans() {
+  let shown = 0;
+  for (const name of listClaudeProfileNames()) {
+    const didShow = await showClaudeCodingPlanProfile(name);
+    if (didShow) shown += 1;
+    if (didShow) console.log("");
+  }
+  return shown;
+}
+
+async function showCodex(name) {
+  const defaultName = readText(codexDefaultPath);
+  section(`Codex (${name}${name === defaultName ? ", default" : ""})`);
+  const authPath = `${codexProfilesDir}/${name}/auth.json`;
+  let auth;
+  try { auth = readJson(authPath); } catch {
+    fail("auth.json not found or invalid");
+    return;
+  }
+  if (auth.auth_mode !== "chatgpt" || !auth.tokens?.access_token) {
+    fail("not using ChatGPT login");
+    return;
+  }
+  try {
+    const headers = {
+      Authorization: `Bearer ${auth.tokens.access_token}`,
+      "User-Agent": "codex-cli",
+      Accept: "application/json",
+    };
+    if (auth.tokens.account_id) headers["ChatGPT-Account-Id"] = auth.tokens.account_id;
+    const res = await fetchJson("https://chatgpt.com/backend-api/wham/usage", { headers });
+    if (!res.ok || !res.body) {
+      fail(`query failed: HTTP ${res.status}`);
+      return;
+    }
+    const rl = res.body.rate_limit;
+    const values = [];
+    if (rl?.primary_window) {
+      values.push(rl.primary_window.used_percent);
+      line("5h", rl.primary_window.used_percent, rl.primary_window.reset_at);
+    }
+    if (rl?.secondary_window) {
+      values.push(rl.secondary_window.used_percent);
+      line("weekly", rl.secondary_window.used_percent, rl.secondary_window.reset_at);
+    }
+    if (!values.length) fail("no quota windows returned");
+    if (res.body.plan_type) console.log(`  plan: ${paint(res.body.plan_type, "magenta")}`);
+    if (rl?.limit_reached) console.log(`  limit: ${paint("reached", "red")}`);
+    const status = statusForUtilization(values);
+    console.log(`  status: ${paint(status, statusColor(status))}`);
+  } catch (e) {
+    fail(`query failed: ${e.message}`);
+  }
+}
+
+(async () => {
+  await showClaudeOfficial();
+  console.log("");
+  await showAllClaudeCodingPlans();
+  const codexNames = listCodexProfileNames();
+  if (!codexNames.length) {
+    section("Codex");
+    fail("no configs found");
+    return;
+  }
+  for (let i = 0; i < codexNames.length; i += 1) {
+    await showCodex(codexNames[i]);
+    if (i < codexNames.length - 1) console.log("");
+  }
+})().catch((e) => {
+  console.error(`boom status failed: ${e.message}`);
+  process.exit(1);
+});
+NODE
+}
+
+boom_usage() {
+  ensure_layout
+  node - "$CODEX_PROFILES" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+const [codexProfilesDir] = process.argv.slice(2);
+const colorEnabled = Boolean(process.env.BOOM_FORCE_COLOR || process.env.CLICOLOR_FORCE) || (!process.env.NO_COLOR && process.stdout.isTTY);
+const C = colorEnabled ? {
+  reset: "\x1b[0m",
+  bold: "\x1b[1m",
+  dim: "\x1b[2m",
+  green: "\x1b[32m",
+  cyan: "\x1b[36m",
+  magenta: "\x1b[35m",
+  blue: "\x1b[34m",
+} : {};
+function paint(value, color) {
+  return colorEnabled ? `${C[color]}${value}${C.reset}` : String(value);
+}
+
+const now = Date.now();
+const dayStart = new Date();
+dayStart.setHours(0, 0, 0, 0);
+const todayMs = dayStart.getTime();
+const sevenDaysMs = now - 7 * 24 * 60 * 60 * 1000;
+
+function readDir(dir) {
+  try { return fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+}
+function readLines(file) {
+  try { return fs.readFileSync(file, "utf8").split(/\r?\n/); } catch { return []; }
+}
+function parseJson(line) {
+  try { return JSON.parse(line); } catch { return null; }
+}
+function parseTime(value) {
+  if (!value) return 0;
+  const ts = Date.parse(value);
+  return Number.isFinite(ts) ? ts : 0;
+}
+function num(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+function fmt(value) {
+  return Math.round(value).toLocaleString("en-US");
+}
+function padRight(value, width) {
+  const text = String(value);
+  return text.length > width ? `${text.slice(0, Math.max(0, width - 1))}…` : text.padEnd(width, " ");
+}
+function totalOf(row) {
+  return row.input + row.output + row.cacheRead + row.cacheCreate;
+}
+function empty() {
+  return { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, calls: 0 };
+}
+function add(dst, src) {
+  dst.input += src.input;
+  dst.output += src.output;
+  dst.cacheRead += src.cacheRead;
+  dst.cacheCreate += src.cacheCreate;
+  dst.calls += src.calls;
+}
+function bucketFor(ts) {
+  const buckets = ["all"];
+  if (ts >= sevenDaysMs) buckets.push("7d");
+  if (ts >= todayMs) buckets.push("today");
+  return buckets;
+}
+function collectJsonl(dir, maxDepth = 10) {
+  const files = [];
+  function walk(current, depth) {
+    if (depth > maxDepth) return;
+    for (const entry of readDir(current)) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) walk(full, depth + 1);
+      else if (entry.isFile() && entry.name.endsWith(".jsonl")) files.push(full);
+    }
+  }
+  walk(dir, 0);
+  return files;
+}
+function collectGeminiSessions() {
+  const base = path.join(os.homedir(), ".gemini", "tmp");
+  const files = [];
+  for (const project of readDir(base)) {
+    if (!project.isDirectory()) continue;
+    const chats = path.join(base, project.name, "chats");
+    for (const entry of readDir(chats)) {
+      if (!entry.isFile()) continue;
+      if (/^session-.*\.jsonl?$/.test(entry.name)) files.push(path.join(chats, entry.name));
+    }
+  }
+  return files;
+}
+function aggregate(rows) {
+  const result = {
+    today: empty(),
+    "7d": empty(),
+    all: empty(),
+    models: new Map(),
+  };
+  for (const row of rows) {
+    for (const bucket of bucketFor(row.ts)) add(result[bucket], row);
+    const model = row.model || "unknown";
+    if (!result.models.has(model)) result.models.set(model, empty());
+    add(result.models.get(model), row);
+  }
+  return result;
+}
+function printSummary(title, rows, filesScanned) {
+  console.log(paint(`== ${title} ==`, "bold"));
+  if (!rows.length) {
+    console.log(`  ${paint("No token records found.", "dim")} Files scanned: ${fmt(filesScanned)}`);
+    return;
+  }
+  const agg = aggregate(rows);
+  for (const [label, bucket] of [["Today", agg.today], ["7 days", agg["7d"]], ["All", agg.all]]) {
+    console.log(`  ${paint(label, "cyan")}`);
+    console.log(`    total ${paint(fmt(totalOf(bucket)), "green")} tokens, ${paint(fmt(bucket.calls), "magenta")} calls`);
+    console.log(`    in ${paint(fmt(bucket.input), "blue")} | out ${paint(fmt(bucket.output), "blue")}`);
+    console.log(`    cache read ${paint(fmt(bucket.cacheRead), "dim")} | write ${paint(fmt(bucket.cacheCreate), "dim")}`);
+  }
+  const topModels = [...agg.models.entries()]
+    .sort((a, b) => totalOf(b[1]) - totalOf(a[1]))
+    .slice(0, 5);
+  if (topModels.length) {
+    console.log("");
+    console.log(`  ${paint("Top models", "cyan")}`);
+    for (const [model, row] of topModels) {
+      console.log(`    ${paint(padRight(model, 22), "magenta")} ${paint(fmt(totalOf(row)), "green")} tokens, ${fmt(row.calls)} calls`);
+    }
+  }
+  console.log(`\n  ${paint("Files scanned:", "dim")} ${fmt(filesScanned)}`);
+}
+
+function claudeRows() {
+  const dir = path.join(os.homedir(), ".claude", "projects");
+  const files = collectJsonl(dir);
+  const byMessage = new Map();
+  for (const file of files) {
+    for (const line of readLines(file)) {
+      if (!line.trim() || !line.includes('"usage"')) continue;
+      const value = parseJson(line);
+      if (!value || value.type !== "assistant") continue;
+      const message = value.message || {};
+      const usage = message.usage || {};
+      const id = message.id;
+      if (!id) continue;
+      const row = {
+        ts: parseTime(value.timestamp),
+        model: message.model || "unknown",
+        input: num(usage.input_tokens),
+        output: num(usage.output_tokens),
+        cacheRead: num(usage.cache_read_input_tokens),
+        cacheCreate: num(usage.cache_creation_input_tokens),
+        calls: message.stop_reason ? 1 : 0,
+        complete: Boolean(message.stop_reason),
+      };
+      if (row.output === 0 && row.input === 0 && row.cacheRead === 0 && row.cacheCreate === 0) continue;
+      const prev = byMessage.get(id);
+      const shouldReplace = !prev ||
+        (row.complete && !prev.complete) ||
+        (row.complete === prev.complete && row.output > prev.output);
+      if (shouldReplace) byMessage.set(id, row);
+    }
+  }
+  const rows = [...byMessage.values()].filter((row) => row.complete && row.output > 0);
+  return { rows, filesScanned: files.length };
+}
+
+function cumulativeFrom(info) {
+  if (!info || typeof info !== "object") return null;
+  return {
+    input: num(info.input_tokens),
+    cacheRead: num(info.cached_input_tokens ?? info.cache_read_input_tokens),
+    output: num(info.output_tokens),
+  };
+}
+function delta(prev, current) {
+  if (!prev) return current;
+  return {
+    input: Math.max(0, current.input - prev.input),
+    cacheRead: Math.max(0, current.cacheRead - prev.cacheRead),
+    output: Math.max(0, current.output - prev.output),
+  };
+}
+function codexRoots() {
+  const roots = [];
+  const homeCodex = path.join(os.homedir(), ".codex");
+  if (fs.existsSync(homeCodex)) roots.push({ label: "home", dir: homeCodex });
+  for (const entry of readDir(codexProfilesDir)) {
+    if (entry.isDirectory()) roots.push({ label: entry.name, dir: path.join(codexProfilesDir, entry.name) });
+  }
+  return roots;
+}
+function codexRowsForRoot(root) {
+  const files = [
+    ...collectJsonl(path.join(root.dir, "sessions"), 5),
+    ...collectJsonl(path.join(root.dir, "archived_sessions"), 2),
+  ];
+  const rows = [];
+  for (const file of files) {
+    let currentModel = "unknown";
+    let prevTotal = null;
+    for (const line of readLines(file)) {
+      if (!line.trim()) continue;
+      const value = parseJson(line);
+      if (!value) continue;
+      if (value.type === "turn_context" && value.payload?.model) currentModel = value.payload.model;
+      if (value.type !== "event_msg" || value.payload?.type !== "token_count") continue;
+      const info = value.payload.info || {};
+      let d = null;
+      if (info.total_token_usage) {
+        const total = cumulativeFrom(info.total_token_usage);
+        if (!total) continue;
+        d = delta(prevTotal, total);
+        prevTotal = total;
+      } else if (info.last_token_usage) {
+        d = cumulativeFrom(info.last_token_usage);
+      }
+      if (!d || (d.input === 0 && d.cacheRead === 0 && d.output === 0)) continue;
+      rows.push({
+        ts: parseTime(value.timestamp),
+        model: info.model || currentModel,
+        input: d.input,
+        output: d.output,
+        cacheRead: Math.min(d.cacheRead, d.input),
+        cacheCreate: 0,
+        calls: 1,
+      });
+    }
+  }
+  return { rows, filesScanned: files.length };
+}
+
+function geminiRowFromMessage(msg) {
+  if (!msg || msg.type !== "gemini" || !msg.tokens || typeof msg.tokens !== "object") return null;
+  const input = num(msg.tokens.input);
+  const output = num(msg.tokens.output) + num(msg.tokens.thoughts);
+  const cacheRead = num(msg.tokens.cached);
+  if (input === 0 && output === 0 && cacheRead === 0) return null;
+  return {
+    ts: parseTime(msg.timestamp),
+    model: msg.model || "unknown",
+    input,
+    output,
+    cacheRead,
+    cacheCreate: 0,
+    calls: 1,
+  };
+}
+function geminiRows() {
+  const files = collectGeminiSessions();
+  const byMessage = new Map();
+  for (const file of files) {
+    if (file.endsWith(".jsonl")) {
+      for (const line of readLines(file)) {
+        if (!line.trim() || !line.includes('"tokens"')) continue;
+        const msg = parseJson(line);
+        const row = geminiRowFromMessage(msg);
+        if (!row) continue;
+        const id = msg.id || `${file}:${row.ts}:${byMessage.size}`;
+        byMessage.set(`${file}:${id}`, row);
+      }
+      continue;
+    }
+
+    let value = null;
+    try { value = JSON.parse(fs.readFileSync(file, "utf8")); } catch { continue; }
+    const messages = Array.isArray(value?.messages) ? value.messages : [];
+    for (const msg of messages) {
+      const row = geminiRowFromMessage(msg);
+      if (!row) continue;
+      const id = msg.id || `${file}:${row.ts}:${byMessage.size}`;
+      byMessage.set(`${file}:${id}`, row);
+    }
+  }
+  return { rows: [...byMessage.values()], filesScanned: files.length };
+}
+
+const claude = claudeRows();
+printSummary("Claude Usage", claude.rows, claude.filesScanned);
+for (const root of codexRoots()) {
+  console.log("");
+  const codex = codexRowsForRoot(root);
+  printSummary(`Codex Usage (${root.label})`, codex.rows, codex.filesScanned);
+}
+console.log("");
+const gemini = geminiRows();
+printSummary("Gemini Usage", gemini.rows, gemini.filesScanned);
+NODE
+}
+
+handle_claude_profile_cmd() {
+  local sub="${1:-}"
+  shift || true
+  case "$sub" in
+    add) claude_add "${1:-}" ;;
+    edit) claude_edit "${1:-}" ;;
+    show) claude_show "$@" ;;
+    list|ls) profile_list claude "$CLAUDE_DEFAULT" ;;
+    default) claude_default "${1:-}" ;;
+    remove|rm|delete) claude_remove "${1:-}" ;;
+    doctor) claude_doctor ;;
+    help|--help|-h|"") usage ;;
+    *) die "unknown Claude command '$sub'" ;;
+  esac
+}
+
+handle_codex_profile_cmd() {
+  local sub="${1:-}"
+  shift || true
+  case "$sub" in
+    add) codex_add "$@" ;;
+    edit) codex_edit "${1:-}" ;;
+    list|ls) profile_list codex "$CODEX_DEFAULT" ;;
+    default) codex_default "${1:-}" ;;
+    remove|rm|delete) codex_remove "${1:-}" ;;
+    doctor) codex_doctor ;;
+    help|--help|-h|"") usage ;;
+    *) die "unknown Codex command '$sub'" ;;
+  esac
+}
+
+parse_run_args() {
+  PARSED_PROFILE=""
+  PARSED_SAFE=0
+  PARSED_NO_PROFILE=0
+  PARSED_ARGS=()
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --)
+        shift
+        PARSED_ARGS+=("$@")
+        break
+        ;;
+      --safe)
+        PARSED_SAFE=1
+        ;;
+      --no-profile)
+        PARSED_NO_PROFILE=1
+        ;;
+      -p|--profile)
+        shift
+        [ "$#" -gt 0 ] || die "$1 requires a name"
+        PARSED_PROFILE="$1"
+        ;;
+      --profile=*)
+        PARSED_PROFILE="${1#--profile=}"
+        ;;
+      -*)
+        PARSED_ARGS+=("$1")
+        ;;
+      *)
+        if [ -z "$PARSED_PROFILE" ]; then
+          PARSED_PROFILE="$1"
+        else
+          PARSED_ARGS+=("$1")
+        fi
+        ;;
+    esac
+    shift || true
+  done
+}
+
+run_claude() {
+  local profile="$1"
+  local safe="$2"
+  local no_profile="$3"
+  shift 3
+  local args=()
+  local profile_path
+
+  [ -x "$REAL_CLAUDE" ] || die "real Claude not found: $REAL_CLAUDE"
+  [ "$safe" -eq 1 ] || args+=("--dangerously-skip-permissions")
+  args+=("$@")
+
+  if [ "$no_profile" -eq 1 ]; then
+    exec "$REAL_CLAUDE" "${args[@]}"
+  fi
+
+  if [ -z "$profile" ]; then
+    profile="$(get_default "$CLAUDE_DEFAULT")"
+  fi
+
+  if [ -z "$profile" ]; then
+    exec "$REAL_CLAUDE" "${args[@]}"
+  fi
+
+  if ! profile_path="$(resolve_claude_profile "$profile")"; then
+    printf "Claude config '%s' does not exist.\n" "$profile" >&2
+    print_missing_profiles claude
+    exit 1
+  fi
+
+  if is_official_claude_profile "$profile_path"; then
+    run_claude_with_user_settings_swap "$profile_path" "${args[@]}"
+  fi
+
+  run_claude_with_settings "$profile_path" "${args[@]}"
+}
+
+run_codex() {
+  local profile="$1"
+  local safe="$2"
+  local no_profile="$3"
+  shift 3
+  local args=()
+  local profile_dir
+
+  [ -x "$REAL_CODEX" ] || die "real Codex not found: $REAL_CODEX"
+  [ "$safe" -eq 1 ] || args+=("--dangerously-bypass-approvals-and-sandbox")
+  args+=("$@")
+
+  if [ "$no_profile" -eq 1 ]; then
+    exec "$REAL_CODEX" "${args[@]}"
+  fi
+
+  if [ -z "$profile" ]; then
+    profile="$(get_default "$CODEX_DEFAULT")"
+  fi
+
+  if [ -z "$profile" ]; then
+    exec "$REAL_CODEX" "${args[@]}"
+  fi
+
+  if ! profile_dir="$(resolve_codex_profile "$profile")"; then
+    printf "Codex config '%s' does not exist.\n" "$profile" >&2
+    print_missing_profiles codex
+    exit 1
+  fi
+
+  CODEX_HOME="$profile_dir" exec "$REAL_CODEX" "${args[@]}"
+}
+
+handle_tool() {
+  local tool="$1"
+  shift || true
+
+  case "${1:-}" in
+    profile)
+      die "'profile' was removed. Use 'boom c list' or 'boom x list' instead."
+      ;;
+    help|--help|-h)
+      usage
+      exit 0
+      ;;
+  esac
+
+  if [ "$tool" = "claude" ]; then
+    case "${1:-}" in
+      add|edit|show|list|ls|default|remove|rm|delete|doctor)
+        handle_claude_profile_cmd "$@"
+        exit $?
+        ;;
+    esac
+  else
+    case "${1:-}" in
+      add|edit|list|ls|default|remove|rm|delete|doctor)
+        handle_codex_profile_cmd "$@"
+        exit $?
+        ;;
+    esac
+  fi
+
+  parse_run_args "$@"
+  if [ "$tool" = "claude" ]; then
+    run_claude "$PARSED_PROFILE" "$PARSED_SAFE" "$PARSED_NO_PROFILE" "${PARSED_ARGS[@]}"
+  else
+    run_codex "$PARSED_PROFILE" "$PARSED_SAFE" "$PARSED_NO_PROFILE" "${PARSED_ARGS[@]}"
+  fi
+}
+
+main() {
+  ensure_layout
+  case "${1:-}" in
+    ""|-h|--help|help)
+      usage
+      ;;
+    status)
+      shift
+      [ "$#" -eq 0 ] || die "usage: boom status"
+      qq_status
+      ;;
+    usage)
+      shift
+      [ "$#" -eq 0 ] || die "usage: boom usage"
+      boom_usage
+      ;;
+    claude|c)
+      shift
+      handle_tool claude "$@"
+      ;;
+    codex|x)
+      shift
+      handle_tool codex "$@"
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"
