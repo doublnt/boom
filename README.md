@@ -20,7 +20,7 @@ A unified launcher for [Claude Code](https://claude.ai/code) and [Codex](https:/
 ## Installation
 
 ```bash
-git clone https://github.com/yinxi/boom.git
+git clone https://github.com/doublnt/boom.git
 cd boom
 bash install.sh
 ```
