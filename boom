@@ -2,9 +2,9 @@
 
 set -eo pipefail
 
-BOOM_HOME="${BOOM_HOME:-${QQ_HOME:-$HOME/.boom}}"
-REAL_CLAUDE="${BOOM_REAL_CLAUDE:-${QQ_REAL_CLAUDE:-}}"
-REAL_CODEX="${BOOM_REAL_CODEX:-${QQ_REAL_CODEX:-/opt/homebrew/bin/codex}}"
+BOOM_HOME="${BOOM_HOME:-$HOME/.boom}"
+REAL_CLAUDE="${BOOM_REAL_CLAUDE:-}"
+REAL_CODEX="${BOOM_REAL_CODEX:-/opt/homebrew/bin/codex}"
 
 CLAUDE_HOME="$BOOM_HOME/claude"
 CLAUDE_PROFILES="$CLAUDE_HOME/profiles"
@@ -81,16 +81,16 @@ Codex commands:
 
 Examples:
   boom claude
-  boom claude minimax
+  boom claude myplan
   boom claude list
   boom status
   boom usage
   boom codex
-  boom codex add my-plus
-  boom codex yinxi-plus
+  boom codex add work
+  boom codex work
   boom codex list
-  boom claude minimax -- -p "reply OK"
-  boom codex yinxi-plus -- exec "reply OK"
+  boom claude myplan -- -p "reply OK"
+  boom codex work -- exec "reply OK"
 
 By default boom adds the existing fast-path permissions:
   Claude: --dangerously-skip-permissions
@@ -911,8 +911,7 @@ function localTime(value) {
   if (typeof value === "number") date = new Date(value < 1e12 ? value * 1000 : value);
   else date = new Date(value);
   if (Number.isNaN(date.getTime())) return String(value);
-  return date.toLocaleString("zh-CN", {
-    timeZone: "Asia/Shanghai",
+  return date.toLocaleString(undefined, {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
