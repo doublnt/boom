@@ -74,10 +74,12 @@ Codex commands:
   boom codex add <name>
   boom codex edit [name]
   boom codex list
-  boom codex list
   boom codex default <name>
   boom codex remove <name>
   boom codex doctor
+
+Import:
+  boom import cc-switch [<path.db|path.sql>]
 
 Examples:
   boom claude
@@ -91,6 +93,8 @@ Examples:
   boom codex list
   boom claude myplan -- -p "reply OK"
   boom codex work -- exec "reply OK"
+  boom import cc-switch
+  boom import cc-switch ~/Downloads/cc-switch-export-20250101.sql
 
 By default boom adds the existing fast-path permissions:
   Claude: --dangerously-skip-permissions
@@ -1638,6 +1642,171 @@ handle_tool() {
   fi
 }
 
+boom_import_cc_switch() {
+  local db_path="${1:-}"
+  local tmp_db=""
+
+  command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 is required for import but was not found"
+
+  if [ -z "$db_path" ]; then
+    local default_dir="$HOME/Library/Application Support/com.ccswitch.desktop"
+    db_path="$(find "$default_dir" -maxdepth 3 \( -name "*.db" -o -name "*.sqlite" -o -name "*.sqlite3" \) -type f 2>/dev/null | head -1)"
+    if [ -z "$db_path" ]; then
+      die "cc-switch database not found at default location.
+  Try running cc-switch once, or export via cc-switch Settings → Export and pass the file:
+    boom import cc-switch ~/Downloads/cc-switch-export-*.sql"
+    fi
+  fi
+
+  [ -f "$db_path" ] || die "file not found: $db_path"
+
+  case "$db_path" in
+    *.sql)
+      tmp_db="$(mktemp "${TMPDIR:-/tmp}/boom-cc-switch.XXXXXX.db")"
+      sqlite3 "$tmp_db" < "$db_path" || die "failed to load SQL dump: $db_path"
+      db_path="$tmp_db"
+      ;;
+  esac
+
+  ensure_layout
+
+  printf 'Importing from: %s\n' "$db_path"
+
+  node - "$db_path" "$CLAUDE_PROFILES" "$CODEX_PROFILES" "$CODEX_SHARED" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+const { spawnSync } = require("child_process");
+
+const [dbPath, claudeProfilesDir, codexProfilesDir, codexSharedDir] = process.argv.slice(2);
+
+function query(sql) {
+  const r = spawnSync("sqlite3", [dbPath], { input: `.mode json\n${sql}\n`, encoding: "utf8" });
+  if (r.error) throw r.error;
+  const text = (r.stdout || "").trim();
+  if (!text) return [];
+  try { return JSON.parse(text); } catch { return []; }
+}
+
+function queryOne(sql) {
+  const r = spawnSync("sqlite3", [dbPath], { input: `${sql}\n`, encoding: "utf8" });
+  return (r.stdout || "").trim();
+}
+
+function safeName(name) {
+  return name.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[-.]|[-.]$/g, "") || "unnamed";
+}
+
+function ensureDir(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+}
+
+// Discover providers table
+const tablesRaw = queryOne(".tables");
+const tables = tablesRaw.split(/\s+/).filter(Boolean);
+const providerTable = tables.find(t => /^providers?$/i.test(t)) || tables.find(t => /provider/i.test(t));
+if (!providerTable) {
+  console.error("Error: no providers table found. Tables: " + tables.join(", "));
+  process.exit(1);
+}
+
+// Discover column names from schema
+const schemaRows = query(`PRAGMA table_info("${providerTable}");`);
+const cols = schemaRows.map(r => (r.name || "").toLowerCase());
+
+function findCol(...candidates) {
+  return candidates.find(c => cols.includes(c.toLowerCase()));
+}
+
+const appCol    = findCol("app", "app_type", "app_id", "type");
+const configCol = findCol("settings_config", "settingsconfig", "settings", "config");
+const nameCol   = findCol("name");
+
+if (!appCol || !configCol || !nameCol) {
+  console.error(`Error: cannot map schema columns. Found: ${cols.join(", ")}`);
+  process.exit(1);
+}
+
+const rows = query(`SELECT * FROM "${providerTable}";`);
+let claudeCount = 0, codexCount = 0, skipped = 0;
+
+for (const row of rows) {
+  const appType = String(row[appCol] || "").toLowerCase();
+  if (appType !== "claude" && appType !== "codex") continue;
+
+  const rawName = String(row[nameCol] || "").trim();
+  if (!rawName) continue;
+
+  const profileName = safeName(rawName);
+  let settings;
+  try {
+    const raw = row[configCol];
+    settings = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (!settings || typeof settings !== "object") throw new Error("not an object");
+  } catch {
+    console.log(`  skip [${appType}] '${rawName}': invalid settings_config`);
+    skipped++;
+    continue;
+  }
+
+  if (appType === "claude") {
+    const outPath = path.join(claudeProfilesDir, `${profileName}.json`);
+    if (fs.existsSync(outPath)) {
+      console.log(`  skip [claude] '${rawName}': '${profileName}' already exists`);
+      skipped++;
+      continue;
+    }
+    ensureDir(claudeProfilesDir);
+    fs.writeFileSync(outPath, JSON.stringify(settings, null, 2) + "\n", { mode: 0o600 });
+    console.log(`  [claude] '${rawName}' → ${profileName}.json`);
+    claudeCount++;
+  }
+
+  if (appType === "codex") {
+    const profileDir = path.join(codexProfilesDir, profileName);
+    if (fs.existsSync(profileDir)) {
+      console.log(`  skip [codex] '${rawName}': '${profileName}' already exists`);
+      skipped++;
+      continue;
+    }
+    ensureDir(profileDir);
+
+    const auth = settings.auth;
+    if (auth && typeof auth === "object") {
+      fs.writeFileSync(path.join(profileDir, "auth.json"), JSON.stringify(auth, null, 2) + "\n", { mode: 0o600 });
+    }
+
+    const toml = settings.config;
+    if (typeof toml === "string") {
+      fs.writeFileSync(path.join(profileDir, "config.toml"), toml, { mode: 0o600 });
+    } else {
+      fs.writeFileSync(path.join(profileDir, "config.toml"), "", { mode: 0o600 });
+    }
+
+    // Symlink shared sessions/history so /resume works across profiles
+    ensureDir(path.join(codexSharedDir, "sessions"));
+    ensureDir(path.join(codexSharedDir, "archived_sessions"));
+    for (const item of ["sessions", "archived_sessions", "history.jsonl", "state_5.sqlite"]) {
+      const link = path.join(profileDir, item);
+      if (!fs.existsSync(link)) {
+        try { fs.symlinkSync(path.join(codexSharedDir, item), link); } catch {}
+      }
+    }
+
+    console.log(`  [codex] '${rawName}' → ${profileName}/`);
+    codexCount++;
+  }
+}
+
+if (claudeCount + codexCount === 0 && skipped === 0) {
+  console.log("No Claude or Codex providers found in cc-switch database.");
+} else {
+  console.log(`\nDone: imported ${claudeCount} Claude, ${codexCount} Codex profile(s). Skipped ${skipped}.`);
+}
+NODE
+
+  [ -n "$tmp_db" ] && rm -f "$tmp_db"
+}
+
 main() {
   ensure_layout
   case "${1:-}" in
@@ -1661,6 +1830,12 @@ main() {
     codex|x)
       shift
       handle_tool codex "$@"
+      ;;
+    import)
+      shift
+      [ "${1:-}" = "cc-switch" ] || die "usage: boom import cc-switch [<path.db|path.sql>]"
+      shift
+      boom_import_cc_switch "${1:-}"
       ;;
     *)
       usage >&2
