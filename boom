@@ -53,6 +53,7 @@ Usage:
   boom -h | --help | help
   boom status
   boom usage
+  boom clean [--dry-run] [--yes]
 
   boom claude [name] [--safe] [--no-profile] [-- <claude args...>]
   boom codex  [name] [--safe] [--no-profile] [-- <codex args...>]
@@ -72,14 +73,12 @@ Claude commands:
 
 Codex commands:
   boom codex add <name>
+  boom codex add <name> --api [--base-url URL] [--model MODEL]
   boom codex edit [name]
   boom codex list
   boom codex default <name>
   boom codex remove <name>
   boom codex doctor
-
-Import:
-  boom import cc-switch [<path.db|path.sql>]
 
 Examples:
   boom claude
@@ -93,8 +92,6 @@ Examples:
   boom codex list
   boom claude myplan -- -p "reply OK"
   boom codex work -- exec "reply OK"
-  boom import cc-switch
-  boom import cc-switch ~/Downloads/cc-switch-export-20250101.sql
 
 By default boom adds the existing fast-path permissions:
   Claude: --dangerously-skip-permissions
@@ -133,6 +130,38 @@ normalize_name() {
 
 json_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g'
+}
+
+# Read a single top-level TOML scalar as a string from a dot-path.
+# Only supports the subset we generate: plain `key = "string"` or `key = number`.
+# Returns "" if the key is missing or the file doesn't exist.
+toml_get() {
+  local file="$1"
+  local path="$2"
+  local key="${path##*.}"
+  [ -f "$file" ] || { printf ''; return 0; }
+  # Match top-level key (or first segment of dot-path: for a.b.c, look up "a"'s table).
+  awk -v k="$key" '
+    BEGIN { in_table = 0 }
+    /^\[model_providers\./ { in_table = 1; next }
+    /^\[/ { in_table = 0; next }
+    in_table && $0 ~ "^[ \t]*" k "[ \t]*=" {
+      line = $0
+      sub(/^[^=]+=/, "", line)
+      gsub(/^[ \t]+|[ \t]+$/, "", line)
+      gsub(/^"|"$/, "", line)
+      print line
+      exit
+    }
+    !in_table && $0 ~ "^[ \t]*" k "[ \t]*=" {
+      line = $0
+      sub(/^[^=]+=/, "", line)
+      gsub(/^[ \t]+|[ \t]+$/, "", line)
+      gsub(/^"|"$/, "", line)
+      print line
+      exit
+    }
+  ' "$file"
 }
 
 get_default() {
@@ -578,73 +607,70 @@ profile_list() {
   local count=0
 
   default_profile="$(get_default "$default_file")"
-  if [ "$kind" = "claude" ]; then
-    while IFS= read -r name; do
-      [ -n "$name" ] || continue
-      count=$((count + 1))
-      [ "$name" = "$default_profile" ] && printf '* %s (default)\n' "$name" || printf '  %s\n' "$name"
-    done < <(list_claude_names)
-  else
-    while IFS= read -r name; do
-      [ -n "$name" ] || continue
-      count=$((count + 1))
-      [ "$name" = "$default_profile" ] && printf '* %s (default)\n' "$name" || printf '  %s\n' "$name"
-    done < <(list_codex_names)
-  fi
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    count=$((count + 1))
+    [ "$name" = "$default_profile" ] && printf '* %s (default)\n' "$name" || printf '  %s\n' "$name"
+  done < <([ "$kind" = "claude" ] && list_claude_names || list_codex_names)
   [ "$count" -gt 0 ] || printf 'No %s configs found.\n' "$kind"
 }
 
-claude_default() {
-  local requested="${1:-}"
-  local path
-  [ -n "$requested" ] || die "usage: boom claude default <name>"
-  path="$(resolve_claude_profile "$requested")" || die "Claude config '$requested' does not exist"
-  set_default_file "$CLAUDE_DEFAULT" "$(profile_name_from_json_path "$path")"
-  printf "Default Claude config set to '%s'.\n" "$(profile_name_from_json_path "$path")"
+# --- kind-polymorphic helpers (kind is "claude" or "codex") ---
+
+# Resolve a profile to its filesystem path (claude .json file / codex dir).
+resolve_profile() {
+  case "$1" in
+    claude) resolve_claude_profile "$2" ;;
+    *)      resolve_codex_profile "$2" ;;
+  esac
 }
 
-codex_default() {
-  local requested="${1:-}"
-  local dir
-  [ -n "$requested" ] || die "usage: boom codex default <name>"
-  dir="$(resolve_codex_profile "$requested")" || die "Codex config '$requested' does not exist"
-  set_default_file "$CODEX_DEFAULT" "${dir##*/}"
-  printf "Default Codex config set to '%s'.\n" "${dir##*/}"
+# Derive the display/profile name from a resolved path.
+profile_display_name() {
+  case "$1" in
+    claude) profile_name_from_json_path "$2" ;;
+    *)      printf '%s\n' "${2##*/}" ;;
+  esac
 }
 
-claude_remove() {
-  local requested="${1:-}"
-  local path
-  local name
-  local default_profile
-  [ -n "$requested" ] || die "usage: boom claude remove <name>"
-  path="$(resolve_claude_profile "$requested")" || die "Claude config '$requested' does not exist"
-  name="$(profile_name_from_json_path "$path")"
-  rm -f "$path"
-  default_profile="$(get_default "$CLAUDE_DEFAULT")"
+# Set label/default-file locals for the given kind. Callers must declare them local.
+profile_kind_meta() {
+  case "$1" in
+    claude) label="Claude"; default_file="$CLAUDE_DEFAULT" ;;
+    *)      label="Codex";  default_file="$CODEX_DEFAULT" ;;
+  esac
+}
+
+profile_default() {
+  local kind="$1"
+  local requested="${2:-}"
+  local label default_file path name
+  profile_kind_meta "$kind"
+  [ -n "$requested" ] || die "usage: boom $kind default <name>"
+  path="$(resolve_profile "$kind" "$requested")" || die "$label config '$requested' does not exist"
+  name="$(profile_display_name "$kind" "$path")"
+  set_default_file "$default_file" "$name"
+  printf "Default %s config set to '%s'.\n" "$label" "$name"
+}
+
+profile_remove() {
+  local kind="$1"
+  local requested="${2:-}"
+  local label default_file path name default_profile
+  profile_kind_meta "$kind"
+  [ -n "$requested" ] || die "usage: boom $kind remove <name>"
+  path="$(resolve_profile "$kind" "$requested")" || die "$label config '$requested' does not exist"
+  name="$(profile_display_name "$kind" "$path")"
+  case "$kind" in
+    claude) rm -f "$path" ;;
+    *)      rm -rf "$path" ;;
+  esac
+  default_profile="$(get_default "$default_file")"
   if [ "$default_profile" = "$name" ]; then
-    rm -f "$CLAUDE_DEFAULT"
-    printf "Removed Claude config '%s' and cleared the default.\n" "$name"
+    rm -f "$default_file"
+    printf "Removed %s config '%s' and cleared the default.\n" "$label" "$name"
   else
-    printf "Removed Claude config '%s'.\n" "$name"
-  fi
-}
-
-codex_remove() {
-  local requested="${1:-}"
-  local dir
-  local name
-  local default_profile
-  [ -n "$requested" ] || die "usage: boom codex remove <name>"
-  dir="$(resolve_codex_profile "$requested")" || die "Codex config '$requested' does not exist"
-  name="${dir##*/}"
-  rm -rf "$dir"
-  default_profile="$(get_default "$CODEX_DEFAULT")"
-  if [ "$default_profile" = "$name" ]; then
-    rm -f "$CODEX_DEFAULT"
-    printf "Removed Codex config '%s' and cleared the default.\n" "$name"
-  else
-    printf "Removed Codex config '%s'.\n" "$name"
+    printf "Removed %s config '%s'.\n" "$label" "$name"
   fi
 }
 
@@ -656,6 +682,7 @@ codex_edit() {
   local new_dir
   local default_profile
   local do_login=0
+  local do_login_answer
   local status
 
   if [ -z "$requested" ]; then
@@ -679,12 +706,6 @@ codex_edit() {
   new_dir="$CODEX_PROFILES/$new_name"
   [ "$new_dir" = "$dir" ] || [ ! -e "$new_dir" ] || die "Codex config '$new_name' already exists"
 
-  printf 'Re-login? [y/N]: '
-  IFS= read -r do_login_answer
-  case "$do_login_answer" in
-    [Yy]*) do_login=1 ;;
-  esac
-
   if [ "$new_dir" != "$dir" ]; then
     mv "$dir" "$new_dir"
     default_profile="$(get_default "$CODEX_DEFAULT")"
@@ -696,6 +717,18 @@ codex_edit() {
   else
     printf "Codex config '%s' unchanged.\n" "$current_name"
   fi
+
+  # API-mode profile: edit base_url / api_key / model, never ask about re-login.
+  if [ -f "$dir/api_key" ]; then
+    codex_edit_api "$dir" "$new_name"
+    return $?
+  fi
+
+  printf 'Re-login? [y/N]: '
+  IFS= read -r do_login_answer
+  case "$do_login_answer" in
+    [Yy]*) do_login=1 ;;
+  esac
 
   if [ "$do_login" -eq 1 ]; then
     printf "Starting Codex login for '%s'. Finish the browser/device login flow when prompted.\n" "$new_name"
@@ -715,18 +748,110 @@ codex_edit() {
   fi
 }
 
+# Update fields for an API-mode Codex profile (one created with `boom codex add --api`).
+codex_edit_api() {
+  local dir="$1"
+  local name="$2"
+  local current_base_url
+  local current_model
+  local new_base_url
+  local new_api_key
+  local new_model
+  local tmp_path
+
+  current_base_url="$(toml_get "$dir/config.toml" 'model_providers.custom.base_url')"
+  current_model="$(toml_get "$dir/config.toml" 'model')"
+
+  printf 'Base URL [%s]: ' "$current_base_url"
+  IFS= read -r new_base_url || true
+  [ -n "$new_base_url" ] || new_base_url="$current_base_url"
+
+  printf 'API Key [leave blank to keep current]: '
+  if [ -t 0 ]; then
+    stty -echo
+    IFS= read -r new_api_key || true
+    stty echo
+    printf '\n'
+  else
+    IFS= read -r new_api_key || true
+  fi
+
+  printf 'Model [%s]: ' "$current_model"
+  IFS= read -r new_model || true
+  [ -n "$new_model" ] || new_model="$current_model"
+
+  [ -n "$new_base_url" ] || die "base URL is required"
+  [ -n "$new_model" ] || die "model is required"
+
+  umask 077
+  tmp_path="$(mktemp "$dir/.config.tmp.XXXXXX")"
+  chmod 600 "$tmp_path"
+  node - "$dir/config.toml" "$tmp_path" "$new_base_url" "$new_model" <<'NODE'
+const fs = require("fs");
+const [inputPath, outputPath, baseUrl, model] = process.argv.slice(2);
+let body = "";
+if (fs.existsSync(inputPath)) {
+  body = fs.readFileSync(inputPath, "utf8");
+}
+
+// Strip the three top-level keys (wherever they may live — must be top-level,
+// not nested inside another table) and the [model_providers...] section block
+// we rewrite. Preserve everything else ([projects."..."], [tui], personality, etc.).
+const strip = (re) => { body = body.replace(re, ""); };
+strip(/^model[ \t]*=.*\n/m);
+strip(/^model_provider[ \t]*=.*\n/m);
+strip(/^preferred_auth_method[ \t]*=.*\n/m);
+strip(/\[\s*model_providers[^\]]*\][\s\S]*?(?=\n\[|\n*$)/);
+
+const esc = (s) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+const header = [
+  `model = "${esc(model)}"`,
+  `model_provider = "custom"`,
+  `preferred_auth_method = "apikey"`,
+  ``,
+].join("\n");
+
+const block = [
+  ``,
+  `[model_providers.custom]`,
+  `name = "custom"`,
+  `base_url = "${esc(baseUrl)}"`,
+  `env_key = "OPENAI_API_KEY"`,
+  `wire_api = "responses"`,
+  ``,
+].join("\n");
+
+// Normalize: trim leading blank lines, then ensure a single blank line between
+// the header and whatever body remains, and ensure body is followed by a blank
+// line before our appended model_providers block.
+body = body.replace(/^\s+/, "");
+const sep = body === "" ? "" : "\n" + (body.endsWith("\n") ? "" : "\n");
+fs.writeFileSync(outputPath, header + sep + body + block, { mode: 0o600 });
+NODE
+  mv "$tmp_path" "$dir/config.toml"
+  chmod 600 "$dir/config.toml" 2>/dev/null || true
+
+  if [ -n "$new_api_key" ]; then
+    printf '%s' "$new_api_key" > "$dir/api_key"
+    chmod 600 "$dir/api_key" 2>/dev/null || true
+  fi
+
+  printf "Updated Codex API config '%s'.\n" "$name"
+}
+
 codex_add() {
-  local requested="${1:-}"
+  local requested=""
   local dir
   local default_profile
   local default_dir=""
   local no_login=0
   local make_default=0
+  local api_mode=0
+  local base_url=""
+  local model=""
+  local api_key=""
+  local item
   local status
-
-  [ -n "$requested" ] || die "usage: boom codex add <name> [--default] [--no-login]"
-  validate_name "$requested"
-  shift || true
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -736,16 +861,52 @@ codex_add() {
       --no-login)
         no_login=1
         ;;
+      --api)
+        api_mode=1
+        ;;
+      --base-url)
+        shift
+        [ "$#" -gt 0 ] || die "--base-url requires a value"
+        base_url="$1"
+        api_mode=1
+        ;;
+      --base-url=*)
+        base_url="${1#--base-url=}"
+        api_mode=1
+        ;;
+      --model)
+        shift
+        [ "$#" -gt 0 ] || die "--model requires a value"
+        model="$1"
+        api_mode=1
+        ;;
+      --model=*)
+        model="${1#--model=}"
+        api_mode=1
+        ;;
       --help|-h)
         printf 'Usage: boom codex add <name> [--default] [--no-login]\n'
+        printf '       boom codex add <name> --api [--base-url URL] [--model MODEL] [--default]\n'
+        printf '\n  Name and flags may appear in any order.\n'
+        printf '  Default (subscription): runs `codex login`.\n'
+        printf '  --api: third-party OpenAI-compatible endpoint. Prompts for base URL,\n'
+        printf '         API key, and model; writes a custom model_provider. The endpoint\n'
+        printf '         must support the Responses API (wire_api = "responses").\n'
         return 0
         ;;
-      *)
+      -*)
         die "unknown option for boom codex add: $1"
+        ;;
+      *)
+        [ -z "$requested" ] || die "unexpected argument: $1"
+        requested="$1"
         ;;
     esac
     shift || true
   done
+
+  [ -n "$requested" ] || die "usage: boom codex add <name> [--default] [--no-login] [--api [--base-url URL] [--model MODEL]]"
+  validate_name "$requested"
 
   dir="$CODEX_PROFILES/$requested"
   [ ! -e "$dir" ] || die "Codex config '$requested' already exists"
@@ -760,6 +921,55 @@ codex_add() {
   for item in sessions archived_sessions history.jsonl state_5.sqlite; do
     [ -e "$dir/$item" ] || ln -s "$CODEX_SHARED/$item" "$dir/$item"
   done
+
+  if [ "$api_mode" -eq 1 ]; then
+    if [ -z "$base_url" ]; then
+      printf 'Base URL: '
+      IFS= read -r base_url
+    fi
+    printf 'API Key: '
+    if [ -t 0 ]; then
+      stty -echo
+      IFS= read -r api_key
+      stty echo
+      printf '\n'
+    else
+      IFS= read -r api_key
+    fi
+    if [ -z "$model" ]; then
+      printf 'Model: '
+      IFS= read -r model
+    fi
+
+    [ -n "$base_url" ] || { rm -rf "$dir"; die "base URL is required"; }
+    [ -n "$api_key" ] || { rm -rf "$dir"; die "API key is required"; }
+    [ -n "$model" ] || { rm -rf "$dir"; die "model is required"; }
+
+    umask 077
+    cat > "$dir/config.toml" <<EOF
+model = "$(json_escape "$model")"
+model_provider = "custom"
+preferred_auth_method = "apikey"
+
+[model_providers.custom]
+name = "$(json_escape "$requested")"
+base_url = "$(json_escape "$base_url")"
+env_key = "OPENAI_API_KEY"
+wire_api = "responses"
+EOF
+    chmod 600 "$dir/config.toml" 2>/dev/null || true
+
+    printf '%s' "$api_key" > "$dir/api_key"
+    chmod 600 "$dir/api_key" 2>/dev/null || true
+
+    if [ "$make_default" -eq 1 ] || [ -z "$(get_default "$CODEX_DEFAULT")" ]; then
+      set_default_file "$CODEX_DEFAULT" "$requested"
+    fi
+
+    printf "Created Codex API config '%s': %s\n" "$requested" "$dir"
+    printf "Launch with: boom codex %s\n" "$requested"
+    return 0
+  fi
 
   default_profile="$(get_default "$CODEX_DEFAULT")"
   if [ -n "$default_profile" ]; then
@@ -853,7 +1063,11 @@ codex_doctor() {
     if default_dir="$(resolve_codex_profile "$default_profile" 2>/dev/null)"; then
       printf '  default: %s (%s)\n' "$default_profile" "$default_dir"
       [ -f "$default_dir/config.toml" ] || { printf '  ERROR: default config.toml missing\n'; status=1; }
-      [ -f "$default_dir/auth.json" ] || { printf '  ERROR: default auth.json missing\n'; status=1; }
+      if [ -f "$default_dir/api_key" ]; then
+        printf '  auth: API key\n'
+      else
+        [ -f "$default_dir/auth.json" ] || { printf '  ERROR: default auth.json missing\n'; status=1; }
+      fi
     else
       printf '  ERROR: default config %s is missing\n' "$default_profile"
       status=1
@@ -1469,8 +1683,8 @@ handle_claude_profile_cmd() {
     edit) claude_edit "${1:-}" ;;
     show) claude_show "$@" ;;
     list|ls) profile_list claude "$CLAUDE_DEFAULT" ;;
-    default) claude_default "${1:-}" ;;
-    remove|rm|delete) claude_remove "${1:-}" ;;
+    default) profile_default claude "${1:-}" ;;
+    remove|rm|delete) profile_remove claude "${1:-}" ;;
     doctor) claude_doctor ;;
     help|--help|-h|"") usage ;;
     *) die "unknown Claude command '$sub'" ;;
@@ -1484,8 +1698,8 @@ handle_codex_profile_cmd() {
     add) codex_add "$@" ;;
     edit) codex_edit "${1:-}" ;;
     list|ls) profile_list codex "$CODEX_DEFAULT" ;;
-    default) codex_default "${1:-}" ;;
-    remove|rm|delete) codex_remove "${1:-}" ;;
+    default) profile_default codex "${1:-}" ;;
+    remove|rm|delete) profile_remove codex "${1:-}" ;;
     doctor) codex_doctor ;;
     help|--help|-h|"") usage ;;
     *) die "unknown Codex command '$sub'" ;;
@@ -1601,6 +1815,11 @@ run_codex() {
     exit 1
   fi
 
+  # API-key profiles (boom codex add --api) supply the key via env_key in config.toml.
+  if [ -f "$profile_dir/api_key" ]; then
+    OPENAI_API_KEY="$(cat "$profile_dir/api_key")" CODEX_HOME="$profile_dir" exec "$REAL_CODEX" "${args[@]}"
+  fi
+
   CODEX_HOME="$profile_dir" exec "$REAL_CODEX" "${args[@]}"
 }
 
@@ -1642,169 +1861,77 @@ handle_tool() {
   fi
 }
 
-boom_import_cc_switch() {
-  local db_path="${1:-}"
-  local tmp_db=""
+# Remove Codex-internal files that are regenerated on the next launch, plus stray
+# .DS_Store. Never touches sessions/history/state (shared), auth.json, or config.toml.
+boom_clean() {
+  local dry_run=0
+  local assume_yes=0
+  local dir f
+  local files=()
 
-  command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 is required for import but was not found"
-
-  if [ -z "$db_path" ]; then
-    local default_dir="$HOME/Library/Application Support/com.ccswitch.desktop"
-    db_path="$(find "$default_dir" -maxdepth 3 \( -name "*.db" -o -name "*.sqlite" -o -name "*.sqlite3" \) -type f 2>/dev/null | head -1)"
-    if [ -z "$db_path" ]; then
-      die "cc-switch database not found at default location.
-  Try running cc-switch once, or export via cc-switch Settings → Export and pass the file:
-    boom import cc-switch ~/Downloads/cc-switch-export-*.sql"
-    fi
-  fi
-
-  [ -f "$db_path" ] || die "file not found: $db_path"
-
-  case "$db_path" in
-    *.sql)
-      tmp_db="$(mktemp "${TMPDIR:-/tmp}/boom-cc-switch.XXXXXX.db")"
-      sqlite3 "$tmp_db" < "$db_path" || die "failed to load SQL dump: $db_path"
-      db_path="$tmp_db"
-      ;;
-  esac
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dry-run|-n) dry_run=1 ;;
+      --yes|-y) assume_yes=1 ;;
+      --help|-h)
+        printf 'Usage: boom clean [--dry-run] [--yes]\n'
+        printf '  Removes regenerated Codex logs (logs_2.sqlite*), old state backups,\n'
+        printf '  and .DS_Store files under %s.\n' "$BOOM_HOME"
+        return 0
+        ;;
+      *) die "unknown option for boom clean: $1" ;;
+    esac
+    shift || true
+  done
 
   ensure_layout
 
-  printf 'Importing from: %s\n' "$db_path"
+  # Stray .DS_Store anywhere under BOOM_HOME.
+  while IFS= read -r f; do
+    [ -n "$f" ] && files+=("$f")
+  done < <(find "$BOOM_HOME" -name '.DS_Store' -type f 2>/dev/null)
 
-  node - "$db_path" "$CLAUDE_PROFILES" "$CODEX_PROFILES" "$CODEX_SHARED" <<'NODE'
-const fs = require("fs");
-const path = require("path");
-const { spawnSync } = require("child_process");
+  # Per-profile regenerated cruft (logs + old state backups). Sessions/history/state
+  # are symlinks into shared/ and are skipped by the -type f / explicit-name checks.
+  for dir in "$CODEX_PROFILES"/*; do
+    [ -d "$dir" ] || continue
+    for f in "$dir"/logs_2.sqlite "$dir"/logs_2.sqlite-shm "$dir"/logs_2.sqlite-wal \
+             "$dir"/state_5.sqlite.backup-*; do
+      [ -f "$f" ] && files+=("$f")
+    done
+  done
 
-const [dbPath, claudeProfilesDir, codexProfilesDir, codexSharedDir] = process.argv.slice(2);
+  if [ "${#files[@]}" -eq 0 ]; then
+    printf 'Nothing to clean.\n'
+    return 0
+  fi
 
-function query(sql) {
-  const r = spawnSync("sqlite3", [dbPath], { input: `.mode json\n${sql}\n`, encoding: "utf8" });
-  if (r.error) throw r.error;
-  const text = (r.stdout || "").trim();
-  if (!text) return [];
-  try { return JSON.parse(text); } catch { return []; }
-}
+  printf 'Cleanable files (regenerated by Codex; safe to remove):\n'
+  for f in "${files[@]}"; do
+    printf '  %6s  %s\n' "$(du -h "$f" 2>/dev/null | awk '{print $1}')" "$f"
+  done
+  printf '\nTotal to free: %s\n' "$(du -ch "${files[@]}" 2>/dev/null | tail -1 | awk '{print $1}')"
 
-function queryOne(sql) {
-  const r = spawnSync("sqlite3", [dbPath], { input: `${sql}\n`, encoding: "utf8" });
-  return (r.stdout || "").trim();
-}
+  if [ "$dry_run" -eq 1 ]; then
+    printf '(dry run; nothing deleted)\n'
+    return 0
+  fi
 
-function safeName(name) {
-  return name.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[-.]|[-.]$/g, "") || "unnamed";
-}
+  if [ "$assume_yes" -ne 1 ]; then
+    printf '\nMake sure Codex is not running, then confirm. Delete? [y/N]: '
+    local answer
+    IFS= read -r answer
+    case "$answer" in
+      [Yy]*) ;;
+      *) printf 'Aborted.\n'; return 0 ;;
+    esac
+  fi
 
-function ensureDir(dir) {
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-}
-
-// Discover providers table
-const tablesRaw = queryOne(".tables");
-const tables = tablesRaw.split(/\s+/).filter(Boolean);
-const providerTable = tables.find(t => /^providers?$/i.test(t)) || tables.find(t => /provider/i.test(t));
-if (!providerTable) {
-  console.error("Error: no providers table found. Tables: " + tables.join(", "));
-  process.exit(1);
-}
-
-// Discover column names from schema
-const schemaRows = query(`PRAGMA table_info("${providerTable}");`);
-const cols = schemaRows.map(r => (r.name || "").toLowerCase());
-
-function findCol(...candidates) {
-  return candidates.find(c => cols.includes(c.toLowerCase()));
-}
-
-const appCol    = findCol("app", "app_type", "app_id", "type");
-const configCol = findCol("settings_config", "settingsconfig", "settings", "config");
-const nameCol   = findCol("name");
-
-if (!appCol || !configCol || !nameCol) {
-  console.error(`Error: cannot map schema columns. Found: ${cols.join(", ")}`);
-  process.exit(1);
-}
-
-const rows = query(`SELECT * FROM "${providerTable}";`);
-let claudeCount = 0, codexCount = 0, skipped = 0;
-
-for (const row of rows) {
-  const appType = String(row[appCol] || "").toLowerCase();
-  if (appType !== "claude" && appType !== "codex") continue;
-
-  const rawName = String(row[nameCol] || "").trim();
-  if (!rawName) continue;
-
-  const profileName = safeName(rawName);
-  let settings;
-  try {
-    const raw = row[configCol];
-    settings = typeof raw === "string" ? JSON.parse(raw) : raw;
-    if (!settings || typeof settings !== "object") throw new Error("not an object");
-  } catch {
-    console.log(`  skip [${appType}] '${rawName}': invalid settings_config`);
-    skipped++;
-    continue;
-  }
-
-  if (appType === "claude") {
-    const outPath = path.join(claudeProfilesDir, `${profileName}.json`);
-    if (fs.existsSync(outPath)) {
-      console.log(`  skip [claude] '${rawName}': '${profileName}' already exists`);
-      skipped++;
-      continue;
-    }
-    ensureDir(claudeProfilesDir);
-    fs.writeFileSync(outPath, JSON.stringify(settings, null, 2) + "\n", { mode: 0o600 });
-    console.log(`  [claude] '${rawName}' → ${profileName}.json`);
-    claudeCount++;
-  }
-
-  if (appType === "codex") {
-    const profileDir = path.join(codexProfilesDir, profileName);
-    if (fs.existsSync(profileDir)) {
-      console.log(`  skip [codex] '${rawName}': '${profileName}' already exists`);
-      skipped++;
-      continue;
-    }
-    ensureDir(profileDir);
-
-    const auth = settings.auth;
-    if (auth && typeof auth === "object") {
-      fs.writeFileSync(path.join(profileDir, "auth.json"), JSON.stringify(auth, null, 2) + "\n", { mode: 0o600 });
-    }
-
-    const toml = settings.config;
-    if (typeof toml === "string") {
-      fs.writeFileSync(path.join(profileDir, "config.toml"), toml, { mode: 0o600 });
-    } else {
-      fs.writeFileSync(path.join(profileDir, "config.toml"), "", { mode: 0o600 });
-    }
-
-    // Symlink shared sessions/history so /resume works across profiles
-    ensureDir(path.join(codexSharedDir, "sessions"));
-    ensureDir(path.join(codexSharedDir, "archived_sessions"));
-    for (const item of ["sessions", "archived_sessions", "history.jsonl", "state_5.sqlite"]) {
-      const link = path.join(profileDir, item);
-      if (!fs.existsSync(link)) {
-        try { fs.symlinkSync(path.join(codexSharedDir, item), link); } catch {}
-      }
-    }
-
-    console.log(`  [codex] '${rawName}' → ${profileName}/`);
-    codexCount++;
-  }
-}
-
-if (claudeCount + codexCount === 0 && skipped === 0) {
-  console.log("No Claude or Codex providers found in cc-switch database.");
-} else {
-  console.log(`\nDone: imported ${claudeCount} Claude, ${codexCount} Codex profile(s). Skipped ${skipped}.`);
-}
-NODE
-
-  [ -n "$tmp_db" ] && rm -f "$tmp_db"
+  local removed=0
+  for f in "${files[@]}"; do
+    rm -f "$f" && removed=$((removed + 1))
+  done
+  printf 'Removed %s item(s).\n' "$removed"
 }
 
 main() {
@@ -1823,6 +1950,10 @@ main() {
       [ "$#" -eq 0 ] || die "usage: boom usage"
       boom_usage
       ;;
+    clean)
+      shift
+      boom_clean "$@"
+      ;;
     claude|c)
       shift
       handle_tool claude "$@"
@@ -1830,12 +1961,6 @@ main() {
     codex|x)
       shift
       handle_tool codex "$@"
-      ;;
-    import)
-      shift
-      [ "${1:-}" = "cc-switch" ] || die "usage: boom import cc-switch [<path.db|path.sql>]"
-      shift
-      boom_import_cc_switch "${1:-}"
       ;;
     *)
       usage >&2
