@@ -51,12 +51,15 @@ boom - unified Claude/Codex launcher
 Usage:
   boom
   boom -h | --help | help
-  boom status
+  boom status [--claude|--codex] [--official]
   boom usage
-  boom clean [--dry-run] [--yes]
+  boom clean [--dry-run] [--yes] [--include-backups] [--include-staging]
+  boom plugins add <local-repository>
+  boom plugins list
+  boom plugins remove <plugin-name>
 
-  boom claude [name] [--safe] [--no-profile] [-- <claude args...>]
-  boom codex  [name] [--safe] [--no-profile] [-- <codex args...>]
+  boom claude [name] [--safe|--unsafe] [--no-profile] [-- <claude args...>]
+  boom codex  [name] [--safe|--unsafe] [--no-profile] [-- <codex args...>]
 
 Short aliases:
   boom c [name] [...]
@@ -93,11 +96,14 @@ Examples:
   boom claude myplan -- -p "reply OK"
   boom codex work -- exec "reply OK"
 
-By default boom adds the existing fast-path permissions:
+Default: preserve native CLI permissions. --safe remains a compatible explicit alias.
+Only --unsafe adds the old fast-path permissions:
   Claude: --dangerously-skip-permissions
   Codex:  --dangerously-bypass-approvals-and-sandbox
 
-Use --safe to skip those flags.
+Put native CLI options after -- (Claude -p means print; boom -p means profile).
+--no-profile keeps native authentication/settings and does not select an account.
+Registered local plugins sync before launch. --no-plugin-sync skips one startup check.
 EOF
 }
 
@@ -118,6 +124,7 @@ validate_name() {
   local name="$1"
   [ -n "$name" ] || die "name cannot be empty"
   case "$name" in
+    .|..|-*) die "name cannot be dot, dot-dot, or start with a dash" ;;
     *[!A-Za-z0-9._-]*)
       die "name can only contain letters, numbers, dot, underscore, and dash"
       ;;
@@ -269,17 +276,20 @@ print_missing_profiles() {
 merged_claude_settings() {
   local profile_path="$1"
   local tmp_path
+  local official=0
+  if is_official_claude_profile "$profile_path"; then official=1; fi
 
   tmp_path="$(mktemp "${TMPDIR:-/tmp}/boom-claude-settings.XXXXXX")"
   chmod 600 "$tmp_path"
 
-  node - "$CLAUDE_COMMON" "$profile_path" "$tmp_path" <<'NODE'
+  if ! node - "$CLAUDE_COMMON" "$profile_path" "$tmp_path" "$official" "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" <<'NODE'
 const fs = require("fs");
-const [commonPath, profilePath, outputPath] = process.argv.slice(2);
+const [commonPath, profilePath, outputPath, official, userPath] = process.argv.slice(2);
 
 function readJson(file) {
   if (!fs.existsSync(file)) return {};
-  return JSON.parse(fs.readFileSync(file, "utf8"));
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); }
+  catch { throw new Error(`Invalid JSON settings: ${file}`); }
 }
 function isObj(value) {
   return value && typeof value === "object" && !Array.isArray(value);
@@ -296,15 +306,39 @@ const common = readJson(commonPath);
 const profile = readJson(profilePath);
 const merged = merge(common, profile);
 const env = profile.env && typeof profile.env === "object" && !Array.isArray(profile.env)
-  ? profile.env
+  ? { ...profile.env }
   : {};
 
 if (!("model" in profile) && !env.ANTHROPIC_MODEL && !env.ANTHROPIC_BASE_URL && !env.ANTHROPIC_AUTH_TOKEN) {
   delete merged.model;
 }
+if (official === "1") {
+  const isProviderEnv = key => /^ANTHROPIC_(API_KEY|AUTH_TOKEN|BASE_URL|MODEL|DEFAULT_.*_MODEL|SMALL_FAST_MODEL|REASONING_MODEL)$/.test(key) || key === "CLAUDE_CODE_SUBAGENT_MODEL" || /^CLAUDE_CODE_USE_(BEDROCK|VERTEX|FOUNDRY)$/.test(key);
+  // Common provider credentials must not turn an official profile into API billing.
+  for (const key of ["apiKeyHelper", "api_format", "apiFormat", "openrouter_compat_mode", "openrouterCompatMode"]) delete merged[key];
+  for (const key of Object.keys(merged.env || {})) {
+    if (isProviderEnv(key)) delete merged.env[key];
+  }
+  // Keep native user plugins/skills enabled. Mask only inherited provider values
+  // in this invocation's higher-priority settings, without rewriting user files.
+  const user = readJson(userPath);
+  if (user.apiKeyHelper) merged.apiKeyHelper = "";
+  for (const key of Object.keys(user.env || {})) {
+    if (isProviderEnv(key)) {
+      merged.env = merged.env || {};
+      merged.env[key] = "";
+    }
+  }
+  // Explicit model choices in this profile still apply; only common provider aliases are removed.
+  for (const [key,value] of Object.entries(env)) if (/^ANTHROPIC_(MODEL|DEFAULT_.*_MODEL)$/.test(key) || key === "CLAUDE_CODE_SUBAGENT_MODEL") merged.env[key]=value;
+}
 
 fs.writeFileSync(outputPath, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
 NODE
+  then
+    rm -f "$tmp_path"
+    return 1
+  fi
 
   printf '%s\n' "$tmp_path"
 }
@@ -321,16 +355,8 @@ const hasThirdPartyConfig = Boolean(
   env.ANTHROPIC_BASE_URL ||
   env.ANTHROPIC_API_KEY ||
   env.ANTHROPIC_AUTH_TOKEN ||
-  env.ANTHROPIC_MODEL ||
-  env.ANTHROPIC_REASONING_MODEL ||
-  env.ANTHROPIC_DEFAULT_HAIKU_MODEL ||
-  env.ANTHROPIC_DEFAULT_OPUS_MODEL ||
-  env.ANTHROPIC_DEFAULT_SONNET_MODEL ||
-  env.ANTHROPIC_SMALL_FAST_MODEL ||
-  profile.apiBaseUrl ||
-  profile.primaryModel ||
-  profile.smallFastModel ||
-  profile.model
+  env.CLAUDE_CODE_USE_BEDROCK || env.CLAUDE_CODE_USE_VERTEX || env.CLAUDE_CODE_USE_FOUNDRY ||
+  profile.apiKeyHelper
 );
 process.exit(hasThirdPartyConfig ? 1 : 0);
 NODE
@@ -345,75 +371,41 @@ clear_claude_provider_env() {
   unset ANTHROPIC_DEFAULT_HAIKU_MODEL
   unset ANTHROPIC_DEFAULT_OPUS_MODEL
   unset ANTHROPIC_DEFAULT_SONNET_MODEL
+  unset ANTHROPIC_DEFAULT_FABLE_MODEL
   unset ANTHROPIC_SMALL_FAST_MODEL
   unset CLAUDE_CODE_SUBAGENT_MODEL
   unset CLAUDE_CODE_EFFORT_LEVEL
   unset CLAUDE_CODE_USE_BEDROCK
   unset CLAUDE_CODE_USE_VERTEX
+  unset CLAUDE_CODE_USE_FOUNDRY
 }
 
 run_claude_with_settings() {
   local profile_path="$1"
   shift
   local settings_path
-  local status
-
-  settings_path="$(merged_claude_settings "$profile_path")"
+  local status child_pid
+  settings_path="$(merged_claude_settings "$profile_path")" || return $?
+  trap 'rm -f "$settings_path"' EXIT
   clear_claude_provider_env
-  "$REAL_CLAUDE" --settings "$settings_path" "$@"
-  status=$?
-  rm -f "$settings_path"
-  exit "$status"
-}
-
-run_claude_with_user_settings_swap() {
-  local profile_path="$1"
-  shift
-  local settings_file="$HOME/.claude/settings.json"
-  local backup_file
-  local effective_settings
-  local merged_settings
-  local status
-
-  mkdir -p "$HOME/.claude"
-  backup_file="$(mktemp "${TMPDIR:-/tmp}/boom-claude-user-settings.XXXXXX")"
-  effective_settings="$(mktemp "${TMPDIR:-/tmp}/boom-claude-official-settings.XXXXXX")"
-  if [ -f "$settings_file" ]; then
-    cp "$settings_file" "$backup_file"
-  else
-    : > "$backup_file"
-  fi
-
-  restore_settings() {
-    if [ -s "$backup_file" ]; then
-      cp "$backup_file" "$settings_file"
-      chmod 600 "$settings_file" 2>/dev/null || true
-    else
-      rm -f "$settings_file"
-    fi
-    rm -f "$backup_file" "$effective_settings" "${merged_settings:-}"
+  stop_claude_child() {
+    local i
+    trap '' INT TERM
+    kill -TERM "$child_pid" 2>/dev/null || true
+    for i in {1..20}; do
+      if ! kill -0 "$child_pid" 2>/dev/null; then break; fi
+      sleep .1
+    done
+    if kill -0 "$child_pid" 2>/dev/null; then kill -KILL "$child_pid" 2>/dev/null || true; fi
+    wait "$child_pid" 2>/dev/null || true
   }
-
-  trap restore_settings EXIT INT TERM
-
-  merged_settings="$(merged_claude_settings "$profile_path")"
-  node - "$merged_settings" "$effective_settings" <<'NODE'
-const fs = require("fs");
-const [settingsPath, outputPath] = process.argv.slice(2);
-const profile = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
-for (const key of ["api_format", "apiFormat", "openrouter_compat_mode", "openrouterCompatMode"]) {
-  delete profile[key];
-}
-fs.writeFileSync(outputPath, `${JSON.stringify(profile, null, 2)}\n`, { mode: 0o600 });
-NODE
-
-  cp "$effective_settings" "$settings_file"
-  chmod 600 "$settings_file" 2>/dev/null || true
-  clear_claude_provider_env
-  "$REAL_CLAUDE" "$@"
-  status=$?
-  restore_settings
-  trap - EXIT INT TERM
+  trap 'stop_claude_child; exit 143' TERM
+  trap 'stop_claude_child; exit 130' INT
+  # Explicit stdin keeps print-mode input and an interactive terminal intact
+  # when bash runs the child asynchronously so it can handle cancellation.
+  "$REAL_CLAUDE" --settings "$settings_path" "$@" <&0 &
+  child_pid=$!
+  if wait "$child_pid"; then status=0; else status=$?; fi
   exit "$status"
 }
 
@@ -456,6 +448,7 @@ claude_add() {
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "$(json_escape "$model")",
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "$(json_escape "$model")",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$(json_escape "$model")",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "$(json_escape "$model")",
     "CLAUDE_CODE_SUBAGENT_MODEL": "$(json_escape "$model")",
     "API_TIMEOUT_MS": "600000",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
@@ -494,7 +487,7 @@ claude_edit() {
 
   current_name="$(profile_name_from_json_path "$path")"
   current_base_url="$(node -e 'const fs=require("fs"); const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.stdout.write((j.env&&j.env.ANTHROPIC_BASE_URL)||"");' "$path")"
-  current_model="$(node -e 'const fs=require("fs"); const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const e=j.env||{}; process.stdout.write(e.ANTHROPIC_MODEL||e.ANTHROPIC_DEFAULT_SONNET_MODEL||"");' "$path")"
+  current_model="$(node -e 'const fs=require("fs"); const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const e=j.env||{}; process.stdout.write(e.ANTHROPIC_MODEL||e.ANTHROPIC_DEFAULT_FABLE_MODEL||e.ANTHROPIC_DEFAULT_SONNET_MODEL||"");' "$path")"
   if is_official_claude_profile "$path"; then
     is_official=1
   fi
@@ -546,6 +539,7 @@ config.env.ANTHROPIC_MODEL = model;
 config.env.ANTHROPIC_DEFAULT_SONNET_MODEL = model;
 config.env.ANTHROPIC_DEFAULT_OPUS_MODEL = model;
 config.env.ANTHROPIC_DEFAULT_HAIKU_MODEL = model;
+config.env.ANTHROPIC_DEFAULT_FABLE_MODEL = model;
 config.env.CLAUDE_CODE_SUBAGENT_MODEL = model;
 fs.writeFileSync(outputPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
 NODE
@@ -794,9 +788,11 @@ if (fs.existsSync(inputPath)) {
   body = fs.readFileSync(inputPath, "utf8");
 }
 
-// Strip the three top-level keys (wherever they may live — must be top-level,
+// Strip the two top-level keys (wherever they may live — must be top-level,
 // not nested inside another table) and the [model_providers...] section block
 // we rewrite. Preserve everything else ([projects."..."], [tui], personality, etc.).
+// preferred_auth_method is absent from the current config reference. Auth comes
+// from native login or this explicitly selected API profile; do not emit it.
 const strip = (re) => { body = body.replace(re, ""); };
 strip(/^model[ \t]*=.*\n/m);
 strip(/^model_provider[ \t]*=.*\n/m);
@@ -807,7 +803,6 @@ const esc = (s) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 const header = [
   `model = "${esc(model)}"`,
   `model_provider = "custom"`,
-  `preferred_auth_method = "apikey"`,
   ``,
 ].join("\n");
 
@@ -949,7 +944,6 @@ codex_add() {
     cat > "$dir/config.toml" <<EOF
 model = "$(json_escape "$model")"
 model_provider = "custom"
-preferred_auth_method = "apikey"
 
 [model_providers.custom]
 name = "$(json_escape "$requested")"
@@ -1081,11 +1075,24 @@ codex_doctor() {
 }
 
 qq_status() {
-  ensure_layout
-  node - "$CLAUDE_DEFAULT" "$CLAUDE_PROFILES" "$CODEX_DEFAULT" "$CODEX_PROFILES" <<'NODE'
+  local target=all official=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --claude|--codex)
+        [ "$target" = all ] || die "choose only one of --claude and --codex"
+        target="${1#--}" ;;
+      --official) official=1 ;;
+      --help|-h) printf 'Usage: boom status [--claude|--codex] [--official]\n'; return 0 ;;
+      *) die "unknown status option: $1" ;;
+    esac
+    shift
+  done
+  node - "$CLAUDE_DEFAULT" "$CLAUDE_PROFILES" "$CODEX_DEFAULT" "$CODEX_PROFILES" "$target" "$official" <<'NODE'
 const fs = require("fs");
 const { execFileSync } = require("child_process");
-const [claudeDefaultPath, claudeProfilesDir, codexDefaultPath, codexProfilesDir] = process.argv.slice(2);
+const [claudeDefaultPath, claudeProfilesDir, codexDefaultPath, codexProfilesDir, target, officialOnly] = process.argv.slice(2);
+const validPercent = n => typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= 100;
+const remaining = n => validPercent(n) ? 100 - n : undefined;
 const colorEnabled = Boolean(process.env.BOOM_FORCE_COLOR || process.env.CLICOLOR_FORCE) || (!process.env.NO_COLOR && process.stdout.isTTY);
 const C = colorEnabled ? {
   reset: "\x1b[0m",
@@ -1107,9 +1114,11 @@ function statusColor(status) {
   return "dim";
 }
 function usageColor(value) {
+  // `value` is remaining quota (0..100); flip the color thresholds so low
+  // remaining reads red, healthy remaining reads green.
   if (typeof value !== "number" || !Number.isFinite(value)) return "dim";
-  if (value >= 95) return "red";
-  if (value >= 80) return "yellow";
+  if (value <= 5) return "red";
+  if (value <= 20) return "yellow";
   return "green";
 }
 
@@ -1128,7 +1137,7 @@ function localTime(value) {
   let date;
   if (typeof value === "number") date = new Date(value < 1e12 ? value * 1000 : value);
   else date = new Date(value);
-  if (Number.isNaN(date.getTime())) return String(value);
+  if (Number.isNaN(date.getTime())) return "unknown";
   return date.toLocaleString(undefined, {
     month: "2-digit",
     day: "2-digit",
@@ -1137,19 +1146,22 @@ function localTime(value) {
     hour12: false,
   });
 }
-function line(label, used, reset) {
-  console.log(`  ${paint(label, "cyan")}: ${paint(pct(used), usageColor(used))} used, reset ${paint(localTime(reset), "dim")}`);
+function line(label, left, reset) {
+  // Subscription windows display remaining quota; callers pass 100 - utilization.
+  console.log(`  ${paint(label, "cyan")}: ${paint(pct(left), usageColor(left))} left, reset ${paint(localTime(reset), "dim")}`);
 }
 function section(title) {
   console.log(paint(title, "bold"));
 }
 function fail(msg) {
-  console.log(`  ${paint(msg, "red")}`);
+  console.log(`  ${paint(`unknown: ${msg}`, "red")}`);
+  process.exitCode = 1;
 }
 function claudeTokenFromKeychain() {
   try {
     const raw = execFileSync("security", ["find-generic-password", "-s", "Claude Code-credentials", "-w"], {
       encoding: "utf8",
+      timeout: 5000,
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
     const json = JSON.parse(raw);
@@ -1160,14 +1172,14 @@ function claudeTokenFromKeychain() {
 }
 function claudeTokenFromFile() {
   try {
-    const json = readJson(`${process.env.HOME}/.claude/.credentials.json`);
+    const json = readJson(`${process.env.CLAUDE_CONFIG_DIR || `${process.env.HOME}/.claude`}/.credentials.json`);
     return (json.claudeAiOauth || json["claude.ai_oauth"] || {}).accessToken || "";
   } catch {
     return "";
   }
 }
 function statusForUtilization(values) {
-  const max = values.filter((v) => typeof v === "number").reduce((a, b) => Math.max(a, b), -1);
+  const max = values.filter(validPercent).reduce((a, b) => Math.max(a, b), -1);
   if (max < 0) return "unknown";
   if (max >= 95) return "limited";
   if (max >= 80) return "high";
@@ -1177,7 +1189,7 @@ async function fetchJson(url, options) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10000);
   try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
+    const res = await fetch(url, { ...options, redirect: "error", signal: controller.signal });
     const text = await res.text();
     let body = null;
     try { body = text ? JSON.parse(text) : null; } catch {}
@@ -1189,7 +1201,8 @@ async function fetchJson(url, options) {
 
 async function showClaudeOfficial() {
   section("Claude Official");
-  const token = claudeTokenFromKeychain() || claudeTokenFromFile();
+  // A custom config directory must not silently select the default keychain account.
+  const token = (process.env.CLAUDE_CONFIG_DIR ? "" : claudeTokenFromKeychain()) || claudeTokenFromFile();
   if (!token) {
     fail("not logged in or credential not found");
     return;
@@ -1208,15 +1221,16 @@ async function showClaudeOfficial() {
     }
     const body = res.body;
     const values = [];
-    if (body.five_hour) {
-      values.push(body.five_hour.utilization);
-      line("5h", body.five_hour.utilization, body.five_hour.resets_at);
+    if (validPercent(body.five_hour?.utilization)) {
+      const used = body.five_hour.utilization;
+      values.push(used);
+      line("5h", remaining(used), body.five_hour.resets_at);
     }
-    for (const key of ["seven_day", "seven_day_opus", "seven_day_sonnet"]) {
+    for (const key of Object.keys(body).filter(key => /^seven_day(?:_[a-z0-9_]+)?$/.test(key)).sort()) {
       const item = body[key];
-      if (item && typeof item.utilization === "number") {
+      if (item && validPercent(item.utilization)) {
         values.push(item.utilization);
-        line(key.replace("seven_day", "7d").replace(/_/g, " "), item.utilization, item.resets_at);
+        line(key.replace("seven_day", "7d").replace(/_/g, " "), remaining(item.utilization), item.resets_at);
       }
     }
     if (!values.length) fail("no quota windows returned");
@@ -1281,21 +1295,27 @@ async function showClaudeCodingPlanProfile(name) {
       fail("no coding plan data returned");
       return true;
     }
-    const fiveTotal = Number(first.current_interval_total_count || 0);
-    const fiveRemaining = Number(first.current_interval_usage_count || 0);
-    const weekTotal = Number(first.current_weekly_total_count || 0);
-    const weekRemaining = Number(first.current_weekly_usage_count || 0);
+    // MiniMax now exposes remaining quota as a percentage; the legacy
+    // current_interval_total_count / usage_count fields are always 0.
+    const asPercent = x => (typeof x === "number" || (typeof x === "string" && x.trim())) && validPercent(Number(x)) ? Number(x) : NaN;
+    const fiveLeft = asPercent(first.current_interval_remaining_percent);
+    const weekLeft = asPercent(first.current_weekly_remaining_percent);
+    const clampUsed = (n) => Number.isFinite(n) ? Math.min(100, Math.max(0, 100 - n)) : NaN;
+    const clampLeft = (n) => Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : NaN;
     const values = [];
-    if (fiveTotal > 0) {
-      const used = ((fiveTotal - fiveRemaining) / fiveTotal) * 100;
+    if (Number.isFinite(fiveLeft)) {
+      const used = clampUsed(fiveLeft);
+      const left = clampLeft(fiveLeft);
       values.push(used);
-      line("5h", used, first.end_time);
+      line("5h", left, first.end_time);
     }
-    if (weekTotal > 0) {
-      const used = ((weekTotal - weekRemaining) / weekTotal) * 100;
+    if (Number.isFinite(weekLeft)) {
+      const used = clampUsed(weekLeft);
+      const left = clampLeft(weekLeft);
       values.push(used);
-      line("weekly", used, first.weekly_end_time);
+      line("weekly", left, first.weekly_end_time);
     }
+    if (!values.length) fail("no quota windows returned");
     const status = statusForUtilization(values);
     console.log(`  status: ${paint(status, statusColor(status))}`);
   } catch (e) {
@@ -1314,10 +1334,9 @@ async function showAllClaudeCodingPlans() {
   return shown;
 }
 
-async function showCodex(name) {
+async function showCodex(name, authPath = `${codexProfilesDir}/${name}/auth.json`) {
   const defaultName = readText(codexDefaultPath);
   section(`Codex (${name}${name === defaultName ? ", default" : ""})`);
-  const authPath = `${codexProfilesDir}/${name}/auth.json`;
   let auth;
   try { auth = readJson(authPath); } catch {
     fail("auth.json not found or invalid");
@@ -1341,16 +1360,23 @@ async function showCodex(name) {
     }
     const rl = res.body.rate_limit;
     const values = [];
-    if (rl?.primary_window) {
-      values.push(rl.primary_window.used_percent);
-      line("5h", rl.primary_window.used_percent, rl.primary_window.reset_at);
-    }
-    if (rl?.secondary_window) {
-      values.push(rl.secondary_window.used_percent);
-      line("weekly", rl.secondary_window.used_percent, rl.secondary_window.reset_at);
+    // Window length comes from the API: free/pro plans may expose only a 7-day primary window.
+    const windowLabel = (w, fallback) => {
+      const secs = Number(w.limit_window_seconds);
+      if (!Number.isFinite(secs) || secs <= 0) return fallback;
+      if (secs === 604800) return "weekly";
+      if (secs % 86400 === 0) return `${secs / 86400}d`;
+      if (secs % 3600 === 0) return `${secs / 3600}h`;
+      return `${secs / 60}m`;
+    };
+    for (const [w, fallback] of [[rl?.primary_window, "primary"], [rl?.secondary_window, "secondary"]]) {
+      if (!w || !validPercent(w.used_percent)) continue;
+      values.push(w.used_percent);
+      line(windowLabel(w, fallback), remaining(w.used_percent), w.reset_at);
     }
     if (!values.length) fail("no quota windows returned");
     if (res.body.plan_type) console.log(`  plan: ${paint(res.body.plan_type, "magenta")}`);
+    if (rl?.cooldown_active) console.log(`  cooldown: ${paint("active", "yellow")}`);
     if (rl?.limit_reached) console.log(`  limit: ${paint("reached", "red")}`);
     const status = statusForUtilization(values);
     console.log(`  status: ${paint(status, statusColor(status))}`);
@@ -1360,9 +1386,16 @@ async function showCodex(name) {
 }
 
 (async () => {
-  await showClaudeOfficial();
-  console.log("");
-  await showAllClaudeCodingPlans();
+  if (target !== "codex") {
+    await showClaudeOfficial();
+    if (officialOnly !== "1") { console.log(""); await showAllClaudeCodingPlans(); }
+  }
+  if (target === "claude") return;
+  if (target !== "codex") console.log("");
+  if (officialOnly === "1") {
+    await showCodex("native", `${process.env.CODEX_HOME || `${process.env.HOME}/.codex`}/auth.json`);
+    return;
+  }
   const codexNames = listCodexProfileNames();
   if (!codexNames.length) {
     section("Codex");
@@ -1381,7 +1414,6 @@ NODE
 }
 
 boom_usage() {
-  ensure_layout
   node - "$CODEX_PROFILES" <<'NODE'
 const fs = require("fs");
 const path = require("path");
@@ -1426,6 +1458,26 @@ function num(value) {
 }
 function fmt(value) {
   return Math.round(value).toLocaleString("en-US");
+}
+function fmtShort(value) {
+  // Compact k/M/B with one decimal; strip trailing ".0" for round numbers.
+  // Below 1k we still emit an exact integer so small counts (e.g. files
+  // scanned) read naturally without a forced unit.
+  if (!Number.isFinite(value)) return "0";
+  const abs = Math.abs(value);
+  if (abs >= 1e9) {
+    const v = (value / 1e9).toFixed(1);
+    return `${v.endsWith(".0") ? v.slice(0, -2) : v}B`;
+  }
+  if (abs >= 1e6) {
+    const v = (value / 1e6).toFixed(1);
+    return `${v.endsWith(".0") ? v.slice(0, -2) : v}M`;
+  }
+  if (abs >= 1e3) {
+    const v = (value / 1e3).toFixed(1);
+    return `${v.endsWith(".0") ? v.slice(0, -2) : v}k`;
+  }
+  return String(Math.round(value));
 }
 function padRight(value, width) {
   const text = String(value);
@@ -1494,15 +1546,15 @@ function aggregate(rows) {
 function printSummary(title, rows, filesScanned) {
   console.log(paint(`== ${title} ==`, "bold"));
   if (!rows.length) {
-    console.log(`  ${paint("No token records found.", "dim")} Files scanned: ${fmt(filesScanned)}`);
+    console.log(`  ${paint("No token records found.", "dim")} Files scanned: ${fmtShort(filesScanned)}`);
     return;
   }
   const agg = aggregate(rows);
   for (const [label, bucket] of [["Today", agg.today], ["7 days", agg["7d"]], ["All", agg.all]]) {
     console.log(`  ${paint(label, "cyan")}`);
-    console.log(`    total ${paint(fmt(totalOf(bucket)), "green")} tokens, ${paint(fmt(bucket.calls), "magenta")} calls`);
-    console.log(`    in ${paint(fmt(bucket.input), "blue")} | out ${paint(fmt(bucket.output), "blue")}`);
-    console.log(`    cache read ${paint(fmt(bucket.cacheRead), "dim")} | write ${paint(fmt(bucket.cacheCreate), "dim")}`);
+    console.log(`    total ${paint(fmtShort(totalOf(bucket)), "green")} tokens, ${paint(fmtShort(bucket.calls), "magenta")} calls`);
+    console.log(`    in ${paint(fmtShort(bucket.input), "blue")} | out ${paint(fmtShort(bucket.output), "blue")}`);
+    console.log(`    cache read ${paint(fmtShort(bucket.cacheRead), "dim")} | write ${paint(fmtShort(bucket.cacheCreate), "dim")}`);
   }
   const topModels = [...agg.models.entries()]
     .sort((a, b) => totalOf(b[1]) - totalOf(a[1]))
@@ -1511,10 +1563,10 @@ function printSummary(title, rows, filesScanned) {
     console.log("");
     console.log(`  ${paint("Top models", "cyan")}`);
     for (const [model, row] of topModels) {
-      console.log(`    ${paint(padRight(model, 22), "magenta")} ${paint(fmt(totalOf(row)), "green")} tokens, ${fmt(row.calls)} calls`);
+      console.log(`    ${paint(padRight(model, 22), "magenta")} ${paint(fmtShort(totalOf(row)), "green")} tokens, ${fmtShort(row.calls)} calls`);
     }
   }
-  console.log(`\n  ${paint("Files scanned:", "dim")} ${fmt(filesScanned)}`);
+  console.log(`\n  ${paint("Files scanned:", "dim")} ${fmtShort(filesScanned)}`);
 }
 
 function claudeRows() {
@@ -1577,13 +1629,23 @@ function codexRoots() {
   }
   return roots;
 }
-function codexRowsForRoot(root) {
+function codexRowsForRoot(root, seen) {
   const files = [
     ...collectJsonl(path.join(root.dir, "sessions"), 5),
     ...collectJsonl(path.join(root.dir, "archived_sessions"), 2),
   ];
   const rows = [];
+  let filesScanned = 0;
   for (const file of files) {
+    // Boom-managed profiles symlink sessions/ and archived_sessions/ to
+    // ~/.boom/codex/shared/{sessions,archived_sessions}, so the same file
+    // appears under every profile root. Dedupe by realpath so we only
+    // count each session file once across all roots.
+    let real;
+    try { real = fs.realpathSync(file); } catch { real = file; }
+    if (seen.has(real)) continue;
+    seen.add(real);
+    filesScanned += 1;
     let currentModel = "unknown";
     let prevTotal = null;
     for (const line of readLines(file)) {
@@ -1614,7 +1676,7 @@ function codexRowsForRoot(root) {
       });
     }
   }
-  return { rows, filesScanned: files.length };
+  return { rows, filesScanned };
 }
 
 function geminiRowFromMessage(msg) {
@@ -1664,11 +1726,20 @@ function geminiRows() {
 
 const claude = claudeRows();
 printSummary("Claude Usage", claude.rows, claude.filesScanned);
+console.log("");
+// Aggregate every codex root (home + each boom profile) into a single
+// summary. Profiles share sessions/archived_sessions via symlinks to
+// ~/.boom/codex/shared, so dedupe by realpath inside codexRowsForRoot
+// to avoid counting the same files once per profile.
+const codexSeen = new Set();
+const codexRows = [];
+let codexFilesScanned = 0;
 for (const root of codexRoots()) {
-  console.log("");
-  const codex = codexRowsForRoot(root);
-  printSummary(`Codex Usage (${root.label})`, codex.rows, codex.filesScanned);
+  const codex = codexRowsForRoot(root, codexSeen);
+  for (const row of codex.rows) codexRows.push(row);
+  codexFilesScanned += codex.filesScanned;
 }
+printSummary("Codex Usage", codexRows, codexFilesScanned);
 console.log("");
 const gemini = geminiRows();
 printSummary("Gemini Usage", gemini.rows, gemini.filesScanned);
@@ -1678,6 +1749,7 @@ NODE
 handle_claude_profile_cmd() {
   local sub="${1:-}"
   shift || true
+  case "$sub" in add|edit|default) ensure_layout ;; esac
   case "$sub" in
     add) claude_add "${1:-}" ;;
     edit) claude_edit "${1:-}" ;;
@@ -1694,6 +1766,7 @@ handle_claude_profile_cmd() {
 handle_codex_profile_cmd() {
   local sub="${1:-}"
   shift || true
+  case "$sub" in add|edit|default) ensure_layout ;; esac
   case "$sub" in
     add) codex_add "$@" ;;
     edit) codex_edit "${1:-}" ;;
@@ -1706,10 +1779,127 @@ handle_codex_profile_cmd() {
   esac
 }
 
+local_plugins() {
+  local sync_pid sync_status
+  BOOM_REAL_CLAUDE="$REAL_CLAUDE" BOOM_REAL_CODEX="$REAL_CODEX" node - "$BOOM_HOME/local-plugins.json" "$@" <<'NODE' &
+const fs = require("fs");
+const path = require("path");
+const {spawn} = require("child_process");
+const [registryPath, mode, ...args] = process.argv.slice(2);
+function load() {
+  if (!fs.existsSync(registryPath)) return {schema_version: 1, plugins: {}};
+  const data = JSON.parse(fs.readFileSync(registryPath, "utf8"));
+  if (data.schema_version !== 1 || !data.plugins || typeof data.plugins !== "object" || Array.isArray(data.plugins)) throw new Error("invalid local plugin registry");
+  return data;
+}
+function save(data) {
+  fs.mkdirSync(path.dirname(registryPath), {recursive: true, mode: 0o700});
+  const temp = `${registryPath}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(temp, `${JSON.stringify(data, null, 2)}\n`, {mode: 0o600, flag: "wx"});
+    fs.renameSync(temp, registryPath);
+  } finally { if (fs.existsSync(temp)) fs.unlinkSync(temp); }
+}
+function identity(source) {
+  return JSON.parse(fs.readFileSync(path.join(source, ".claude-plugin/plugin.json"), "utf8")).name;
+}
+function adapter(source) {
+  const script = fs.realpathSync(path.join(source, "scripts/sync-local-plugins.py"));
+  const relative = path.relative(source, script);
+  if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative) || !fs.statSync(script).isFile()) throw new Error("sync adapter must be a file inside the registered repository");
+  return script;
+}
+let child = null;
+function terminate(signal = "SIGTERM", pid = child?.pid) {
+  if (pid) { try { process.kill(-pid, signal); } catch (error) { if (error.code !== "ESRCH") throw error; } }
+}
+for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]]) {
+  process.on(signal, () => { const pid = child?.pid; terminate("SIGTERM", pid); setTimeout(() => { terminate("SIGKILL", pid); process.exit(code); }, 2000); });
+}
+async function ensure(script, tool, home) {
+  return new Promise((resolve, reject) => {
+    const env = {...process.env, [tool === "codex" ? "CODEX_HOME" : "CLAUDE_CONFIG_DIR"]: home};
+    child = spawn("python3", [script, "--target", tool, "--ensure"], {env, detached: true, stdio: ["ignore", "pipe", "inherit"]});
+    let output = "", expired = false;
+    let killTimer;
+    const timer = setTimeout(() => {
+      expired = true; const pid = child?.pid; terminate("SIGTERM", pid);
+      killTimer = setTimeout(() => terminate("SIGKILL", pid), 2000);
+    }, 120000);
+    child.stdout.on("data", chunk => {
+      output += chunk;
+      if (output.length > 1024 * 1024) { expired = true; terminate("SIGKILL"); }
+    });
+    const clear = () => { clearTimeout(timer); if (!expired) clearTimeout(killTimer); child = null; };
+    child.on("error", error => { clear(); reject(error); });
+    child.on("close", code => {
+      clear();
+      if (expired || code !== 0) return reject(new Error(expired ? "local plugin sync timed out" : `local plugin sync failed (exit ${code})`));
+      try {
+        const result = JSON.parse(output);
+        if (result.schema_version !== 1 || result.status !== "ready" || typeof result.updated !== "boolean" || typeof result.version !== "string") throw new Error("invalid sync adapter response");
+        resolve(result);
+      } catch (error) { reject(error); }
+    });
+  });
+}
+async function main() {
+  const data = load();
+  if (mode === "add") {
+    if (args.length !== 1) throw new Error("usage: boom plugins add <local-repository>");
+    const source = fs.realpathSync(args[0]);
+    const name = identity(source);
+    if (typeof name !== "string" || !/^[a-z0-9][a-z0-9-]*$/.test(name)) throw new Error("invalid plugin name");
+    adapter(source);
+    data.plugins[name] = {source}; save(data);
+    console.log(`Registered ${name}: ${source}\nLocal sync adapter will run before future launches.`);
+  } else if (mode === "list") {
+    if (args.length) throw new Error("usage: boom plugins list");
+    for (const [name, entry] of Object.entries(data.plugins)) console.log(`${name}\t${entry.source}`);
+  } else if (mode === "remove") {
+    if (args.length !== 1 || !Object.hasOwn(data.plugins, args[0])) throw new Error("usage: boom plugins remove <registered-plugin-name>");
+    delete data.plugins[args[0]]; save(data);
+    console.log(`Stopped automatic sync for ${args[0]}. Installed copies are retained.`);
+  } else if (mode === "ensure") {
+    const [tool, home] = args;
+    if (!["claude", "codex"].includes(tool) || !home || args.length !== 2) throw new Error("invalid sync target");
+    for (const [name, entry] of Object.entries(data.plugins)) {
+      const source = fs.realpathSync(entry.source);
+      if (identity(source) !== name) throw new Error(`registered plugin identity changed: ${name}`);
+      const result = await ensure(adapter(source), tool, home);
+      if (result.updated) console.error(`boom: updated ${name} to ${result.version} in ${home}`);
+    }
+  } else throw new Error("usage: boom plugins add|list|remove");
+}
+main().catch(error => { console.error(`boom: ${error.message}`); process.exitCode = 1; });
+NODE
+  sync_pid=$!
+  trap 'kill -TERM "$sync_pid" 2>/dev/null || true; wait "$sync_pid" 2>/dev/null || true; exit 143' TERM
+  trap 'kill -INT "$sync_pid" 2>/dev/null || true; wait "$sync_pid" 2>/dev/null || true; exit 130' INT
+  if wait "$sync_pid"; then sync_status=0; else sync_status=$?; fi
+  trap - INT TERM
+  return "$sync_status"
+}
+
+sync_local_plugins() {
+  local tool="$1" home="$2" arg
+  shift 2
+  [ "${PARSED_PLUGIN_SYNC:-1}" -eq 1 ] || return 0
+  [ -f "$BOOM_HOME/local-plugins.json" ] || return 0
+  case "${1:-}" in
+    plugin|plugins|auth|login|logout|completion|completions|app-server|mcp|mcp-server) return 0 ;;
+  esac
+  for arg in "$@"; do
+    case "$arg" in --version|--help|-h|--ignore-user-config) return 0 ;; esac
+  done
+  local_plugins ensure "$tool" "$home"
+}
+
 parse_run_args() {
   PARSED_PROFILE=""
-  PARSED_SAFE=0
+  PARSED_SAFE=1
   PARSED_NO_PROFILE=0
+  PARSED_PLUGIN_SYNC=1
   PARSED_ARGS=()
 
   while [ "$#" -gt 0 ]; do
@@ -1722,8 +1912,14 @@ parse_run_args() {
       --safe)
         PARSED_SAFE=1
         ;;
+      --unsafe)
+        PARSED_SAFE=0
+        ;;
       --no-profile)
         PARSED_NO_PROFILE=1
+        ;;
+      --no-plugin-sync)
+        PARSED_PLUGIN_SYNC=0
         ;;
       -p|--profile)
         shift
@@ -1761,6 +1957,7 @@ run_claude() {
   args+=("$@")
 
   if [ "$no_profile" -eq 1 ]; then
+    sync_local_plugins claude "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" "$@"
     exec "$REAL_CLAUDE" "${args[@]}"
   fi
 
@@ -1769,6 +1966,7 @@ run_claude() {
   fi
 
   if [ -z "$profile" ]; then
+    sync_local_plugins claude "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" "$@"
     exec "$REAL_CLAUDE" "${args[@]}"
   fi
 
@@ -1778,10 +1976,7 @@ run_claude() {
     exit 1
   fi
 
-  if is_official_claude_profile "$profile_path"; then
-    run_claude_with_user_settings_swap "$profile_path" "${args[@]}"
-  fi
-
+  sync_local_plugins claude "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" "$@"
   run_claude_with_settings "$profile_path" "${args[@]}"
 }
 
@@ -1798,6 +1993,7 @@ run_codex() {
   args+=("$@")
 
   if [ "$no_profile" -eq 1 ]; then
+    sync_local_plugins codex "${CODEX_HOME:-$HOME/.codex}" "$@"
     exec "$REAL_CODEX" "${args[@]}"
   fi
 
@@ -1806,6 +2002,7 @@ run_codex() {
   fi
 
   if [ -z "$profile" ]; then
+    sync_local_plugins codex "${CODEX_HOME:-$HOME/.codex}" "$@"
     exec "$REAL_CODEX" "${args[@]}"
   fi
 
@@ -1815,6 +2012,7 @@ run_codex() {
     exit 1
   fi
 
+  sync_local_plugins codex "$profile_dir" "$@"
   # API-key profiles (boom codex add --api) supply the key via env_key in config.toml.
   if [ -f "$profile_dir/api_key" ]; then
     OPENAI_API_KEY="$(cat "$profile_dir/api_key")" CODEX_HOME="$profile_dir" exec "$REAL_CODEX" "${args[@]}"
@@ -1861,22 +2059,27 @@ handle_tool() {
   fi
 }
 
-# Remove Codex-internal files that are regenerated on the next launch, plus stray
-# .DS_Store. Never touches sessions/history/state (shared), auth.json, or config.toml.
+# Remove Codex/Claude-internal files that are regenerated on the next launch,
+# plus stray .DS_Store. Never touches sessions/history/state (shared), auth.json,
+# or config.toml. Bounded depths so we never sweep into symlinked session trees.
 boom_clean() {
   local dry_run=0
   local assume_yes=0
-  local dir f
+  local include_backups=0 include_staging=0
+  local dir f size total
   local files=()
+  local dirs=()
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --dry-run|-n) dry_run=1 ;;
       --yes|-y) assume_yes=1 ;;
+      --include-backups) include_backups=1 ;;
+      --include-staging) include_staging=1 ;;
       --help|-h)
-        printf 'Usage: boom clean [--dry-run] [--yes]\n'
-        printf '  Removes regenerated Codex logs (logs_2.sqlite*), old state backups,\n'
-        printf '  and .DS_Store files under %s.\n' "$BOOM_HOME"
+        printf 'Usage: boom clean [--dry-run] [--yes] [--include-backups] [--include-staging]\n'
+        printf '  Selects Codex logs and .DS_Store under %s.\n' "$BOOM_HOME"
+        printf '  Backups and staging directories are excluded unless explicitly selected.\n'
         return 0
         ;;
       *) die "unknown option for boom clean: $1" ;;
@@ -1884,33 +2087,59 @@ boom_clean() {
     shift || true
   done
 
-  ensure_layout
-
-  # Stray .DS_Store anywhere under BOOM_HOME.
-  while IFS= read -r f; do
+  # find does not follow symlinks; NUL records preserve unusual path names.
+  while IFS= read -r -d '' f; do
     [ -n "$f" ] && files+=("$f")
-  done < <(find "$BOOM_HOME" -name '.DS_Store' -type f 2>/dev/null)
+  done < <(find "$BOOM_HOME" -maxdepth 6 -name '.DS_Store' -type f -print0 2>/dev/null)
 
-  # Per-profile regenerated cruft (logs + old state backups). Sessions/history/state
-  # are symlinks into shared/ and are skipped by the -type f / explicit-name checks.
+  # Per-profile regenerated cruft. Sessions/history/state are symlinks into
+  # shared/ and find does not follow them, so they are never inspected.
   for dir in "$CODEX_PROFILES"/*; do
     [ -d "$dir" ] || continue
-    for f in "$dir"/logs_2.sqlite "$dir"/logs_2.sqlite-shm "$dir"/logs_2.sqlite-wal \
-             "$dir"/state_5.sqlite.backup-*; do
+    [ ! -L "$dir" ] || continue
+    # Codex logs: per-profile SQLite (each profile owns its own copy).
+    for f in "$dir"/logs_2.sqlite "$dir"/logs_2.sqlite-shm "$dir"/logs_2.sqlite-wal; do
       [ -f "$f" ] && files+=("$f")
     done
+    # Codex plugin sync staging (often hundreds of MB; fully rewritten on next launch).
+    if [ "$include_staging" -eq 1 ] && [ -d "$dir/.tmp" ] && [ ! -L "$dir/.tmp" ]; then dirs+=("$dir/.tmp"); fi
+    # Legacy config backups created by old boom codex edit invocations.
+    while IFS= read -r -d '' f; do
+      if [ "$include_backups" -eq 1 ] && [ -n "$f" ]; then files+=("$f"); fi
+    done < <(find "$dir" -maxdepth 1 -name 'config.toml.bak.*' -type f -print0 2>/dev/null)
   done
 
-  if [ "${#files[@]}" -eq 0 ]; then
+  # Shared codex state backups + global-state tmp files. state_5.sqlite is
+  # symlinked into each profile but the backups live in the shared root, so
+  # we have to scan shared/ directly (per-profile glob is a no-op).
+  while IFS= read -r -d '' f; do
+    if [ "$include_backups" -eq 1 ] && [ -n "$f" ]; then files+=("$f"); fi
+  done < <(find "$CODEX_SHARED" -maxdepth 1 -name 'state_5.sqlite.backup-*' -type f -print0 2>/dev/null)
+
+  while IFS= read -r -d '' f; do
+    if [ "$include_staging" -eq 1 ] && [ -n "$f" ]; then files+=("$f"); fi
+  done < <(find "$CODEX_HOME_ROOT" -maxdepth 2 -name '..codex-global-state.json.tmp-*' -type f -print0 2>/dev/null)
+
+  # Claude side: legacy backups of common.json or per-profile JSON files.
+  while IFS= read -r -d '' f; do
+    if [ "$include_backups" -eq 1 ] && [ -n "$f" ]; then files+=("$f"); fi
+  done < <(find "$CLAUDE_HOME" -maxdepth 2 \( -name 'common.json.bak.*' -o -name '*.json.bak.*' \) -type f -print0 2>/dev/null)
+
+  if [ "${#files[@]}" -eq 0 ] && [ "${#dirs[@]}" -eq 0 ]; then
     printf 'Nothing to clean.\n'
     return 0
   fi
 
-  printf 'Cleanable files (regenerated by Codex; safe to remove):\n'
+  printf 'Selected cleanup items (stop affected CLIs before deletion):\n'
   for f in "${files[@]}"; do
     printf '  %6s  %s\n' "$(du -h "$f" 2>/dev/null | awk '{print $1}')" "$f"
   done
-  printf '\nTotal to free: %s\n' "$(du -ch "${files[@]}" 2>/dev/null | tail -1 | awk '{print $1}')"
+  for dir in "${dirs[@]}"; do
+    size=$(du -sh "$dir" 2>/dev/null | awk '{print $1}')
+    printf '  %6s  %s/\n' "${size:-?}" "$dir"
+  done
+  total=$(du -sch "${files[@]}" "${dirs[@]}" 2>/dev/null | tail -1 | awk '{print $1}')
+  printf '\nTotal to free: %s\n' "$total"
 
   if [ "$dry_run" -eq 1 ]; then
     printf '(dry run; nothing deleted)\n'
@@ -1918,7 +2147,7 @@ boom_clean() {
   fi
 
   if [ "$assume_yes" -ne 1 ]; then
-    printf '\nMake sure Codex is not running, then confirm. Delete? [y/N]: '
+    printf '\nMake sure Codex/Claude are not running, then confirm. Delete? [y/N]: '
     local answer
     IFS= read -r answer
     case "$answer" in
@@ -1931,19 +2160,20 @@ boom_clean() {
   for f in "${files[@]}"; do
     rm -f "$f" && removed=$((removed + 1))
   done
+  for dir in "${dirs[@]}"; do
+    rm -rf "$dir" && removed=$((removed + 1))
+  done
   printf 'Removed %s item(s).\n' "$removed"
 }
 
 main() {
-  ensure_layout
   case "${1:-}" in
     ""|-h|--help|help)
       usage
       ;;
     status)
       shift
-      [ "$#" -eq 0 ] || die "usage: boom status"
-      qq_status
+      qq_status "$@"
       ;;
     usage)
       shift
@@ -1953,6 +2183,10 @@ main() {
     clean)
       shift
       boom_clean "$@"
+      ;;
+    plugins)
+      shift
+      local_plugins "${1:-list}" "${@:2}"
       ;;
     claude|c)
       shift
