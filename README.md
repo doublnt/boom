@@ -1,5 +1,7 @@
 # boom
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 A unified launcher for [Claude Code](https://claude.ai/code) and [Codex](https://github.com/openai/codex) that manages multiple named profiles — useful when you have several API accounts, providers, or subscription plans.
 
 ## Features
