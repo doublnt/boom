@@ -4,7 +4,7 @@ set -eo pipefail
 
 BOOM_HOME="${BOOM_HOME:-$HOME/.boom}"
 REAL_CLAUDE="${BOOM_REAL_CLAUDE:-}"
-REAL_CODEX="${BOOM_REAL_CODEX:-/opt/homebrew/bin/codex}"
+REAL_CODEX="${BOOM_REAL_CODEX:-}"
 
 CLAUDE_HOME="$BOOM_HOME/claude"
 CLAUDE_PROFILES="$CLAUDE_HOME/profiles"
@@ -43,6 +43,28 @@ find_real_claude() {
 }
 
 REAL_CLAUDE="$(find_real_claude || true)"
+
+find_real_codex() {
+  local candidate
+  if [ -n "$REAL_CODEX" ]; then
+    printf '%s\n' "$REAL_CODEX"
+    return 0
+  fi
+  candidate="$(type -P codex || true)"
+  if [ -n "$candidate" ] && [ -x "$candidate" ] && [ "$candidate" != "$0" ]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  for candidate in "$HOME/.local/bin/codex" /opt/homebrew/bin/codex /usr/local/bin/codex; do
+    if [ -x "$candidate" ] && [ "$candidate" != "$0" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+REAL_CODEX="$(find_real_codex || true)"
 
 usage() {
   cat <<'EOF'
@@ -139,36 +161,151 @@ json_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g'
 }
 
-# Read a single top-level TOML scalar as a string from a dot-path.
-# Only supports the subset we generate: plain `key = "string"` or `key = number`.
-# Returns "" if the key is missing or the file doesn't exist.
+# Edit named TOML statements while retaining unrelated settings and comments.
+codex_config() {
+  node - "$@" <<'NODE'
+const fs = require("fs");
+const [mode, inputPath, output, baseUrl, model] = process.argv.slice(2);
+const id = path => JSON.stringify(path);
+const prefix = (path, parent) => parent.every((part, i) => path[i] === part);
+function scalar(text) {
+  if (/^'[^'\r\n]*'$/.test(text)) return text.slice(1, -1);
+  if (!/^"(?:[^"\\\r\n]|\\.)*"$/.test(text)) throw new Error("expected a single-line TOML string");
+  const escapes = {b: "\b", t: "\t", n: "\n", f: "\f", r: "\r", '"': '"', '\\': '\\'};
+  return text.slice(1, -1).replace(/\\(u[\da-fA-F]{4}|U[\da-fA-F]{8}|.)/g, (_, escape) => {
+    if (Object.hasOwn(escapes, escape)) return escapes[escape];
+    if (/^[uU]/.test(escape)) return String.fromCodePoint(parseInt(escape.slice(1), 16));
+    throw new Error("unsupported TOML escape");
+  });
+}
+function key(text) {
+  const path = [];
+  let rest = text;
+  for (;;) {
+    rest = rest.trimStart();
+    const match = rest.match(/^(?:"(?:\\.|[^"\\\r\n])*"|'[^'\r\n]*'|[A-Za-z0-9_-]+)/);
+    if (!match) throw new Error("cannot read TOML key");
+    path.push(/^["']/.test(match[0]) ? scalar(match[0]) : match[0]);
+    rest = rest.slice(match[0].length).trimStart();
+    if (!rest.startsWith(".")) return {path, rest, length: text.length - rest.length};
+    rest = rest.slice(1);
+  }
+}
+function statements(text) {
+  const records = [], brackets = [];
+  let start = 0, code = "", quote = "", multiline = false, comment = false, commentAt = -1;
+  const finish = end => {
+    records.push({text: text.slice(start, end), code: code.trim(), commentAt});
+    start = end; code = ""; commentAt = -1;
+  };
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (comment) {
+      if (ch !== "\n") continue;
+      comment = false;
+    }
+    if (quote) {
+      code += ch;
+      if (quote === '"' && ch === "\\") { code += text[++i] || ""; continue; }
+      if (ch === quote) {
+        if (!multiline) quote = "";
+        else if (text.slice(i, i + 3) === quote.repeat(3)) {
+          while (text[i + 1] === quote) code += text[++i];
+          quote = "";
+        }
+      } else if (ch === "\n" && !multiline) throw new Error("unterminated TOML string");
+      continue;
+    }
+    if (ch === "#") {
+      comment = true;
+      if (!brackets.length) commentAt = i - start;
+      continue;
+    }
+    code += ch;
+    if (ch === '"' || ch === "'") {
+      quote = ch; multiline = text.slice(i, i + 3) === ch.repeat(3);
+      if (multiline) { code += ch.repeat(2); i += 2; }
+    } else if (ch === "[" || ch === "{") brackets.push(ch);
+    else if (ch === "]" || ch === "}") {
+      if (brackets.pop() !== (ch === "]" ? "[" : "{")) throw new Error("unbalanced TOML collection");
+    } else if (ch === "\n" && !brackets.length) finish(i + 1);
+  }
+  if (quote || brackets.length) throw new Error("unterminated TOML value");
+  if (start < text.length) finish(text.length);
+  let table = [];
+  for (const record of records) {
+    if (!record.code) continue;
+    if (record.code.startsWith("[")) {
+      const width = record.code.startsWith("[[") ? 2 : 1;
+      if (!record.code.endsWith("]".repeat(width))) throw new Error("invalid TOML table");
+      const parsed = key(record.code.slice(width, -width).trim());
+      if (parsed.rest) throw new Error("invalid TOML table key");
+      table = parsed.path; record.path = table; record.header = true;
+    } else {
+      const parsed = key(record.code);
+      if (!parsed.rest.startsWith("=")) throw new Error("invalid TOML assignment");
+      record.path = [...table, ...parsed.path];
+      record.value = parsed.rest.slice(1).trim();
+      record.valueAt = record.text.match(/^[ \t]*/)[0].length + parsed.length + 1;
+    }
+  }
+  return records;
+}
+function main() {
+  const records = statements(inputPath && fs.existsSync(inputPath) ? fs.readFileSync(inputPath, "utf8") : "");
+  if ((mode === "edit" || (mode === "get" && output.startsWith("model_providers."))) &&
+      records.some(record => !record.header &&
+        (id(record.path) === id(["model_providers"]) || id(record.path) === id(["model_providers", "custom"])))) {
+    throw new Error("API editing requires a model_providers.custom table or dotted keys; inline tables are left unchanged");
+  }
+  if (mode === "get") {
+    const record = records.find(record => !record.header && id(record.path) === id(output.split(".")));
+    if (record) process.stdout.write(scalar(record.value));
+    return;
+  }
+  const provider = ["model_providers", "custom"];
+  const updates = new Map(mode === "subscription" ? [[id(["model_provider"]), "openai"]] : [
+    [id(["model"]), model], [id(["model_provider"]), "custom"],
+    [id([...provider, "base_url"]), baseUrl], [id([...provider, "env_key"]), "OPENAI_API_KEY"],
+    [id([...provider, "wire_api"]), "responses"],
+  ]);
+  if (mode === "edit" && !records.some(record => id(record.path) === id([...provider, "name"]))) {
+    updates.set(id([...provider, "name"]), "custom");
+  }
+  const pending = new Map(updates);
+  const reset = new Set(["model", "model_provider", "profile", "forced_login_method", "openai_base_url", "preferred_auth_method"]);
+  const body = records.map(record => {
+    if (!record.path) return record.text;
+    if (mode === "subscription" && (prefix(record.path, ["model_providers"]) ||
+        (record.path.length === 1 && reset.has(record.path[0])))) return "";
+    if (!record.header && id(record.path) === id(["preferred_auth_method"])) return "";
+    if (record.header || !updates.has(id(record.path))) return record.text;
+    pending.delete(id(record.path));
+    const tail = record.commentAt >= 0 ? " " + record.text.slice(record.commentAt) : (record.text.match(/\r?\n$/)?.[0] || "");
+    return record.text.slice(0, record.valueAt) + " " + JSON.stringify(updates.get(id(record.path))) + tail;
+  });
+  let header = "";
+  const providerHeader = records.findIndex(record => record.header && id(record.path) === id(provider));
+  const parentHeader = records.findIndex(record => record.header && id(record.path) === id(["model_providers"]));
+  const insertAt = providerHeader >= 0 ? providerHeader : parentHeader;
+  for (const [pathId, value] of pending) {
+    const path = JSON.parse(pathId);
+    if (path.length > 1 && insertAt >= 0) {
+      const relative = path.slice(records[insertAt].path.length);
+      if (!body[insertAt].endsWith("\n")) body[insertAt] += "\n";
+      body[insertAt] += `${relative.join(".")} = ${JSON.stringify(value)}\n`;
+    } else header += `${path.join(".")} = ${JSON.stringify(value)}\n`;
+  }
+  const updated = header + body.join("");
+  fs.writeFileSync(output, updated.endsWith("\n") ? updated : updated + "\n", {mode: 0o600});
+}
+try { main(); }
+catch (error) { console.error(`boom: cannot ${mode} Codex config: ${error.message}`); process.exitCode = 1; }
+NODE
+}
+
 toml_get() {
-  local file="$1"
-  local path="$2"
-  local key="${path##*.}"
-  [ -f "$file" ] || { printf ''; return 0; }
-  # Match top-level key (or first segment of dot-path: for a.b.c, look up "a"'s table).
-  awk -v k="$key" '
-    BEGIN { in_table = 0 }
-    /^\[model_providers\./ { in_table = 1; next }
-    /^\[/ { in_table = 0; next }
-    in_table && $0 ~ "^[ \t]*" k "[ \t]*=" {
-      line = $0
-      sub(/^[^=]+=/, "", line)
-      gsub(/^[ \t]+|[ \t]+$/, "", line)
-      gsub(/^"|"$/, "", line)
-      print line
-      exit
-    }
-    !in_table && $0 ~ "^[ \t]*" k "[ \t]*=" {
-      line = $0
-      sub(/^[^=]+=/, "", line)
-      gsub(/^[ \t]+|[ \t]+$/, "", line)
-      gsub(/^"|"$/, "", line)
-      print line
-      exit
-    }
-  ' "$file"
+  codex_config get "$1" "$2"
 }
 
 get_default() {
@@ -545,6 +682,7 @@ fs.writeFileSync(outputPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o6
 NODE
     mv "$tmp_path" "$new_path"
     chmod 600 "$new_path"
+    if [ "$new_path" != "$path" ]; then rm -f "$path"; fi
   fi
 
   if [ "$new_path" != "$path" ]; then
@@ -780,49 +918,10 @@ codex_edit_api() {
   umask 077
   tmp_path="$(mktemp "$dir/.config.tmp.XXXXXX")"
   chmod 600 "$tmp_path"
-  node - "$dir/config.toml" "$tmp_path" "$new_base_url" "$new_model" <<'NODE'
-const fs = require("fs");
-const [inputPath, outputPath, baseUrl, model] = process.argv.slice(2);
-let body = "";
-if (fs.existsSync(inputPath)) {
-  body = fs.readFileSync(inputPath, "utf8");
-}
-
-// Strip the two top-level keys (wherever they may live — must be top-level,
-// not nested inside another table) and the [model_providers...] section block
-// we rewrite. Preserve everything else ([projects."..."], [tui], personality, etc.).
-// preferred_auth_method is absent from the current config reference. Auth comes
-// from native login or this explicitly selected API profile; do not emit it.
-const strip = (re) => { body = body.replace(re, ""); };
-strip(/^model[ \t]*=.*\n/m);
-strip(/^model_provider[ \t]*=.*\n/m);
-strip(/^preferred_auth_method[ \t]*=.*\n/m);
-strip(/\[\s*model_providers[^\]]*\][\s\S]*?(?=\n\[|\n*$)/);
-
-const esc = (s) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-const header = [
-  `model = "${esc(model)}"`,
-  `model_provider = "custom"`,
-  ``,
-].join("\n");
-
-const block = [
-  ``,
-  `[model_providers.custom]`,
-  `name = "custom"`,
-  `base_url = "${esc(baseUrl)}"`,
-  `env_key = "OPENAI_API_KEY"`,
-  `wire_api = "responses"`,
-  ``,
-].join("\n");
-
-// Normalize: trim leading blank lines, then ensure a single blank line between
-// the header and whatever body remains, and ensure body is followed by a blank
-// line before our appended model_providers block.
-body = body.replace(/^\s+/, "");
-const sep = body === "" ? "" : "\n" + (body.endsWith("\n") ? "" : "\n");
-fs.writeFileSync(outputPath, header + sep + body + block, { mode: 0o600 });
-NODE
+  if ! codex_config edit "$dir/config.toml" "$tmp_path" "$new_base_url" "$new_model"; then
+    rm -f "$tmp_path"
+    return 1
+  fi
   mv "$tmp_path" "$dir/config.toml"
   chmod 600 "$dir/config.toml" 2>/dev/null || true
 
@@ -839,6 +938,7 @@ codex_add() {
   local dir
   local default_profile
   local default_dir=""
+  local source_config=""
   local no_login=0
   local make_default=0
   local api_mode=0
@@ -971,12 +1071,11 @@ EOF
   fi
 
   if [ -n "$default_dir" ] && [ -f "$default_dir/config.toml" ]; then
-    cp "$default_dir/config.toml" "$dir/config.toml"
+    source_config="$default_dir/config.toml"
   elif [ -f "$HOME/.codex/config.toml" ]; then
-    cp "$HOME/.codex/config.toml" "$dir/config.toml"
-  else
-    : > "$dir/config.toml"
+    source_config="$HOME/.codex/config.toml"
   fi
+  codex_config subscription "$source_config" "$dir/config.toml"
   chmod 600 "$dir/config.toml" 2>/dev/null || true
 
   if [ "$make_default" -eq 1 ] || [ -z "$(get_default "$CODEX_DEFAULT")" ]; then
@@ -1665,12 +1764,14 @@ function codexRowsForRoot(root, seen) {
         d = cumulativeFrom(info.last_token_usage);
       }
       if (!d || (d.input === 0 && d.cacheRead === 0 && d.output === 0)) continue;
+      // Codex input already includes cache hits; summaries add them separately.
+      const cacheRead = Math.min(d.cacheRead, d.input);
       rows.push({
         ts: parseTime(value.timestamp),
         model: info.model || currentModel,
-        input: d.input,
+        input: Math.max(0, d.input - cacheRead),
         output: d.output,
-        cacheRead: Math.min(d.cacheRead, d.input),
+        cacheRead,
         cacheCreate: 0,
         calls: 1,
       });

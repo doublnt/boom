@@ -113,6 +113,8 @@ Use `--no-profile` to inherit native CLI login/settings without applying boom's 
 
 Each directory in `codex/profiles/` is an isolated `CODEX_HOME`. Sessions and history are symlinked to a shared location so `/resume` works across profiles.
 
+New subscription profiles inherit general preferences, but reset provider/model selections and API login restrictions. Existing profiles are not migrated. API profile editing preserves other providers and nested settings; use standard TOML tables or dotted keys. Inline provider tables are rejected without rewriting the configuration.
+
 Plugin caches are also per profile. Updating native Codex does not update a boom profile. Inspect the environment you actually launch:
 
 ```bash
@@ -193,7 +195,7 @@ boom plugins remove <plugin-name>
 
 Quota windows use the returned duration and display **remaining** percentages. Null/malformed values are unknown, not 100% remaining. Claude's returned `seven_day_*` buckets are shown by their provider names, without guessing model mappings. Failed quota queries return nonzero while still displaying other providers. `status` uses best-effort subscription endpoints; it does not refresh authentication, buy/reset quota, or make model calls. A custom CLAUDE_CONFIG_DIR uses that directory's credential file, without falling back to the default keychain account.
 
-`usage` is a local token estimate, not remaining quota or cash spend. Shared Codex session paths are deduplicated before both token and file counts. Existing compact k/M/B display is retained.
+`usage` is a local token estimate, not remaining quota or cash spend. Shared Codex session paths are deduplicated before both token and file counts. Codex input is shown excluding cache hits; totals include each cached token once. Existing compact k/M/B display is retained.
 
 `clean` excludes backup files and synchronization staging by default. Include them only with `--include-backups` / `--include-staging`, after stopping affected CLIs and checking whether backups are needed. `--yes` skips its prompt, not this responsibility. No cleanup runs at launch or during status queries.
 
@@ -224,7 +226,7 @@ boom x --safe --no-profile -- login status
 python3 -m unittest discover -s tests -v
 ```
 
-The test suite uses a disposable HOME, fake CLIs and HTTP fixtures; it never contacts models or touches real account settings. See [CHANGE_REPORT.md](CHANGE_REPORT.md) for this update's verification and rollback details. References: [Claude CLI](https://code.claude.com/docs/en/cli-reference), [Claude settings](https://code.claude.com/docs/en/settings), [Codex config](https://learn.chatgpt.com/docs/config-file/config-reference).
+The test suite requires Python 3.11+ and uses a disposable HOME, fake CLIs and HTTP fixtures; it never contacts models or touches real account settings. See [CHANGE_REPORT.md](CHANGE_REPORT.md) for this update's verification and rollback details. References: [Claude CLI](https://code.claude.com/docs/en/cli-reference), [Claude settings](https://code.claude.com/docs/en/settings), [Codex config](https://learn.chatgpt.com/docs/config-file/config-reference).
 
 ## Environment variables
 
@@ -232,7 +234,7 @@ The test suite uses a disposable HOME, fake CLIs and HTTP fixtures; it never con
 |---|---|---|
 | `BOOM_HOME` | `~/.boom` | Root directory for all boom data |
 | `BOOM_REAL_CLAUDE` | auto-detected | Path to the real `claude` binary |
-| `BOOM_REAL_CODEX` | `/opt/homebrew/bin/codex` | Path to the real `codex` binary |
+| `BOOM_REAL_CODEX` | auto-detected | Path to the real `codex` binary; otherwise PATH is searched before known install locations |
 
 ## License
 

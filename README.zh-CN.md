@@ -113,6 +113,8 @@ boom 的数据默认保存在 `~/.boom/`，可通过 `$BOOM_HOME` 修改根目�
 
 `codex/profiles/` 下的每个目录都是独立的 `CODEX_HOME`。会话和历史记录通过符号链接指向共享目录，因此可以跨配置使用 `/resume`。
 
+新建订阅配置会继承通用偏好，但会重置服务商、模型选择及 API 登录限制；已有配置不会自动迁移。编辑 API 配置时会保留其他服务商和嵌套设置，请使用标准 TOML 表或点分隔键。内联服务商表会被拒绝编辑，原配置不会被重写。
+
 插件缓存也按配置独立保存，更新原生 Codex 的插件不会同步更新 boom 配置中的插件。请在实际启动的环境中检查：
 
 ```bash
@@ -193,7 +195,7 @@ boom plugins remove <plugin-name>
 
 额度窗口采用接口返回的时长，显示**剩余百分比**。缺失或格式错误的值显示为未知，不会被当作剩余 100%。Claude 返回的 `seven_day_*` 窗口按服务商提供的名称展示，不猜测模型对应关系。查询失败时返回非零退出码，但仍会展示其他服务商的结果。`status` 尽力通过订阅接口查询，不刷新认证、不购买或重置额度，也不调用模型。指定 `CLAUDE_CONFIG_DIR` 时，使用该目录中的凭据文件，不回退到默认钥匙串账号。
 
-`usage` 是本地 token 用量估算，不代表剩余额度或实际费用。共享的 Codex 会话路径会先去重，再统计 token 和文件数量，保留 k／M／B 简写显示。
+`usage` 是本地 token 用量估算，不代表剩余额度或实际费用。共享的 Codex 会话路径会先去重，再统计 token 和文件数量。Codex 输入列不含缓存命中的 token，总量中每个缓存 token 只计一次，保留 k／M／B 简写显示。
 
 `clean` 默认排除备份和同步暂存文件。需要清理这些内容时，先停止相关 CLI 并确认备份是否还需要，再显式指定 `--include-backups`／`--include-staging`。`--yes` 只跳过确认提示，仍需自行完成这些检查。启动和查询额度时不会自动清理。
 
@@ -224,7 +226,7 @@ boom x --safe --no-profile -- login status
 python3 -m unittest discover -s tests -v
 ```
 
-测试使用临时 HOME、模拟 CLI 和 HTTP 测试数据，不调用模型或修改真实账号设置。验证和回退说明见 [CHANGE_REPORT.md](CHANGE_REPORT.md)。参考文档：[Claude CLI](https://code.claude.com/docs/en/cli-reference)、[Claude 设置](https://code.claude.com/docs/en/settings)、[Codex 配置](https://learn.chatgpt.com/docs/config-file/config-reference)。
+测试需要 Python 3.11+，使用临时 HOME、模拟 CLI 和 HTTP 测试数据，不调用模型或修改真实账号设置。验证和回退说明见 [CHANGE_REPORT.md](CHANGE_REPORT.md)。参考文档：[Claude CLI](https://code.claude.com/docs/en/cli-reference)、[Claude 设置](https://code.claude.com/docs/en/settings)、[Codex 配置](https://learn.chatgpt.com/docs/config-file/config-reference)。
 
 ## 环境变量
 
@@ -232,7 +234,7 @@ python3 -m unittest discover -s tests -v
 |---|---|---|
 | `BOOM_HOME` | `~/.boom` | boom 数据根目录 |
 | `BOOM_REAL_CLAUDE` | 自动检测 | 原生 `claude` 可执行文件路径 |
-| `BOOM_REAL_CODEX` | `/opt/homebrew/bin/codex` | 原生 `codex` 可执行文件路径 |
+| `BOOM_REAL_CODEX` | 自动检测 | 原生 `codex` 可执行文件路径；未设置时先搜索 PATH，再检查常见安装位置 |
 
 ## 许可证
 

@@ -7,24 +7,30 @@
 - Register trusted local repositories with `boom plugins add`. Run their sync adapters before launch in the selected Claude or Codex environment. Preserve native stdin/stdout, bound sync execution, stop startup on failure, and support `--no-plugin-sync`.
 - Keep quota results unknown when fields are missing or invalid, display returned window durations, and deduplicate shared session usage.
 - Protect backup and staging files during default cleanup, handle unusual filenames, and reject invalid profile names.
+- Find Codex through an explicit override, PATH, then known installation locations.
+- New subscription profiles retain general preferences while resetting provider/model selection and API login restrictions. Existing profiles are not migrated.
+- Edit API configuration by TOML statement scope, preserving other providers, nested settings, comments and multiline values. Inline provider tables are rejected without rewriting the configuration.
+- Remove the old Claude profile after a successful rename, and count Codex cached input tokens once.
 
 ## Verification
 
 - Bash syntax and Git whitespace checks pass.
-- 24 regression tests pass, including two opt-in native Claude checks with isolated homes. Fake CLI and HTTP fixtures cover permissions, settings, cleanup, quota parsing, usage deduplication, plugin sync and cancellation.
-- Native Claude checks exercise plugin discovery and authentication status using synthetic settings. They do not make model requests or use real account credentials.
-- Real model execution and full interactive terminal behavior are outside these checks.
+- The offline suite covers launch isolation, plugin synchronization, PATH discovery, subscription routing, TOML editing, profile renaming, and cached token totals. Three opt-in native CLI checks cover plugin discovery and configuration loading.
+- Native checks use Claude Code 2.1.296 and Codex CLI 0.162.1 with isolated homes and synthetic authentication. They exercise plugin discovery, auth status and the edited configuration without model requests or real account credentials.
+- Real model execution, full interactive terminal behavior, and Intel/Linux hosts are outside these checks.
 
-Run the offline suite with:
+Run the offline suite with Python 3.11+:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-To include the isolated native Claude checks:
+To include the isolated native Claude and Codex checks:
 
 ```bash
-BOOM_TEST_REAL_CLAUDE="$(command -v claude)" python3 -m unittest discover -s tests -v
+BOOM_TEST_REAL_CLAUDE="$(command -v claude)" \
+BOOM_TEST_REAL_CODEX="$(command -v codex)" \
+python3 -m unittest discover -s tests -v
 ```
 
 ## Upgrade and rollback
